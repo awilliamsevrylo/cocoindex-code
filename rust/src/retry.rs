@@ -24,6 +24,7 @@ fn says_too_large(body: &str) -> bool {
     [
         "too many tokens", "too_many_tokens", "max allowed tokens", "token limit",
         "maximum context", "too long", "too large", "max_tokens", "exceeds",
+        "invalid string length",
     ]
         .iter()
         .any(|p| b.contains(p))
@@ -61,8 +62,17 @@ pub fn classify(
         if attempt < max_retries { Action::Retry(backoff(attempt, retry_after)) } else { Action::Fail }
     };
     match status {
-        None => retry(),
-        Some(429) | Some(500) | Some(502) | Some(503) | Some(504) => retry(),
+        Some(429) => retry(),
+        Some(502) if batch_len > 1 && body.to_ascii_lowercase().contains("invalid string length") => {
+            Action::Split
+        }
+        None | Some(500) | Some(502) | Some(503) | Some(504) => {
+            if attempt >= 2 && batch_len > 1 {
+                Action::Split
+            } else {
+                retry()
+            }
+        }
         Some(400) | Some(413) if says_too_large(body) => {
             if batch_len > 1 { Action::Split } else { Action::Fail }
         }
@@ -90,6 +100,36 @@ mod tests {
         for s in [Some(429), Some(500), Some(502), Some(503), Some(504), None] {
             assert!(matches!(c(s, "", 4, 0), Action::Retry(_)), "{s:?}");
         }
+    }
+
+    #[test]
+    fn server_5xx_and_transport_split_after_retries_if_batch_larger_than_one() {
+        // 502 attempt-0 -> Retry
+        assert!(matches!(c(Some(502), "", 4, 0), Action::Retry(_)));
+        // 502 attempt-2 batch 8 -> Split
+        assert_eq!(c(Some(502), "", 8, 2), Action::Split);
+        // 502 attempt-2 batch 1 -> Retry (cannot split single-item batch)
+        assert!(matches!(c(Some(502), "", 1, 2), Action::Retry(_)));
+
+        // 500, 503, 504, None attempt-2 batch 8 -> Split
+        for s in [Some(500), Some(503), Some(504), None] {
+            assert_eq!(c(s, "", 8, 2), Action::Split, "{s:?}");
+        }
+        // 500, 503, 504, None attempt-0 batch 8 -> Retry
+        for s in [Some(500), Some(503), Some(504), None] {
+            assert!(matches!(c(s, "", 8, 0), Action::Retry(_)), "{s:?}");
+        }
+        // 429 attempt-5 -> Retry (never splits on 429)
+        assert!(matches!(classify(Some(429), "", 8, 5, 8, None), Action::Retry(_)));
+    }
+
+    #[test]
+    fn invalid_string_length_splits_immediately() {
+        let body = r#"{"error":"Invalid string length"}"#;
+        // 502 with Invalid string length on attempt 0 splits if batch > 1
+        assert_eq!(c(Some(502), body, 8, 0), Action::Split);
+        // batch 1 cannot split -> retries
+        assert!(matches!(c(Some(502), body, 1, 0), Action::Retry(_)));
     }
 
     #[test]
