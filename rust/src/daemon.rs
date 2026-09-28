@@ -13,13 +13,14 @@ use tokio::sync::{Mutex, Notify};
 use crate::daemon_paths::{daemon_pid_path, daemon_runtime_dir, daemon_socket_path};
 use crate::embedder::{CodeEmbedder, create_embedder};
 use crate::embedder_params::{Params, resolve_embedder_params};
+use crate::index_model::{EmbedderCache, IndexMeta, effective_embedding};
 use crate::protocol::{
     DaemonProjectInfo, DoctorCheckResult, Request, Response, SearchResult, VERSION, read_msg,
     write_msg,
 };
 use crate::schema::TABLE_NAME;
 use crate::settings::{
-    UserSettings, global_settings_mtime_us, load_project_settings, load_user_settings,
+    EmbeddingSettings, UserSettings, global_settings_mtime_us, load_project_settings, load_user_settings,
     target_sqlite_db_path, user_settings_path,
 };
 
@@ -29,8 +30,11 @@ use crate::settings::{
 
 struct Project {
     root: PathBuf,
-    embedder: CodeEmbedder,
-    query_params: Params,
+    /// Global embedding settings; the project's settings.yml may override
+    /// them per index (resolved on every index/search, so edits apply
+    /// without a daemon restart).
+    global: EmbeddingSettings,
+    embedders: Arc<EmbedderCache>,
     index_lock: Mutex<()>,
     /// Whether a load-time initial index has been kicked off, and whether it
     /// has finished. Ports `Project._initial_index_done` + the
@@ -81,10 +85,20 @@ impl Project {
         }
     }
 
+    /// This project's effective embedder + query params.
+    async fn embedder(&self) -> Result<(CodeEmbedder, Params)> {
+        let ps = load_project_settings(&self.root)?;
+        let eff = effective_embedding(&self.global, &ps.embedding.unwrap_or_default());
+        self.embedders.get(&eff).await
+    }
+
     async fn run_index(&self) -> Result<()> {
         let _guard = self.index_lock.lock().await;
         let ps = load_project_settings(&self.root)?;
-        crate::indexer::run_index(&self.root, &self.embedder, &ps).await?;
+        let (embedder, _) = self.embedder().await?;
+        crate::indexer::run_index(&self.root, &embedder, &ps).await?;
+        let meta = IndexMeta { model: embedder.state_key(), dims: embedder.dimension().await? };
+        crate::index_model::write_meta(&target_sqlite_db_path(&self.root), &meta).await?;
         Ok(())
     }
 
@@ -103,8 +117,11 @@ impl Project {
                 db_path.display()
             );
         }
-        let query_vec = self.embedder.embed(query, &self.query_params).await?;
+        let (embedder, query_params) = self.embedder().await?;
         let pool = crate::db::open_readonly_pool(&db_path).await?;
+        let meta = crate::index_model::read_meta(&pool).await?;
+        crate::index_model::check_compatible(meta.as_ref(), &embedder.state_key())?;
+        let query_vec = embedder.embed(query, &query_params).await?;
         let results =
             crate::query::query_codebase(&pool, &query_vec, limit, offset, languages, paths).await?;
         Ok(results
@@ -185,6 +202,9 @@ struct ProjectRegistry {
     embedder_error: Option<String>,
     indexing_params: Params,
     query_params: Params,
+    /// Global settings the embedder above was built from.
+    global: Option<EmbeddingSettings>,
+    embedders: Arc<EmbedderCache>,
     projects: Mutex<HashMap<String, Arc<Project>>>,
 }
 
@@ -199,7 +219,7 @@ impl ProjectRegistry {
     }
 
     async fn get_project(&self, root: &str) -> Result<Arc<Project>> {
-        let Some(embedder) = &self.embedder else {
+        let (Some(_), Some(global)) = (&self.embedder, &self.global) else {
             return Err(self.no_embedder_error());
         };
         let mut projects = self.projects.lock().await;
@@ -208,8 +228,8 @@ impl ProjectRegistry {
         }
         let project = Arc::new(Project {
             root: PathBuf::from(root),
-            embedder: embedder.clone(),
-            query_params: self.query_params.clone(),
+            global: global.clone(),
+            embedders: self.embedders.clone(),
             index_lock: Mutex::new(()),
             initial_started: std::sync::atomic::AtomicBool::new(false),
             initial_done: std::sync::atomic::AtomicBool::new(false),
@@ -604,12 +624,18 @@ async fn build_registry() -> (ProjectRegistry, Vec<String>, Vec<String>) {
                         }
                         match create_embedder(&user.embedding, &params.indexing).await {
                             Ok(embedder) => {
+                                let embedders = Arc::new(EmbedderCache::default());
+                                embedders
+                                    .seed(&user.embedding, embedder.clone(), params.query.clone())
+                                    .await;
                                 return (
                                     ProjectRegistry {
                                         embedder: Some(embedder),
                                         embedder_error: None,
                                         indexing_params: params.indexing,
                                         query_params: params.query,
+                                        global: Some(user.embedding.clone()),
+                                        embedders,
                                         projects: Mutex::new(HashMap::new()),
                                     },
                                     settings_env_names,
@@ -640,6 +666,8 @@ async fn build_registry() -> (ProjectRegistry, Vec<String>, Vec<String>) {
             embedder_error,
             indexing_params: Params::new(),
             query_params: Params::new(),
+            global: None,
+            embedders: Arc::new(EmbedderCache::default()),
             projects: Mutex::new(HashMap::new()),
         },
         settings_env_names,

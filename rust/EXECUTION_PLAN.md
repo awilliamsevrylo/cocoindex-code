@@ -36,6 +36,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 2 | 13 named DOs = 13 distinct sticky IPs; collision fails closed | PASS | run 1 caught 00/04/05 collision; placement re-homed 04,05 → 4/4, 65 calls 0 err |
 | 3 | `/v1/embeddings` router: token budget, per-slot 429 cooldown | PASS | unit 6/6, 4/4 mutants killed; live 9/9 incl. retrieval sanity |
 | 4 | Rust `ccc` indexes + searches through the Worker | PASS | unit 6/6, 4/4 mutants killed; live 7/7 (dims 1024, auth.py top hit); e2e 46/0 + 21/0 |
+| 4b | per-index model: two models, one daemon; mismatch refused | PASS | unit 8/8, 4/4 mutants killed; live 11/11 (384 + 1024 in one daemon) |
 | 5 | client in-flight requests bounded | — | |
 | 6 | re-run never re-embeds finished chunks | — | |
 | 7 | fault suite (429, oversize, slow) has teeth | — | |
@@ -224,6 +225,56 @@ existing `indexing_params: {input_type: document}` / `query_params:
 - `state_key` is `litellm:<model>`; the endpoint is excluded on purpose
   (Worker and direct Voyage are the same vectors). Model changes still
   re-embed; per-index model pinning is POC 4b.
+
+## POC 4b — pass criteria (written before code)
+
+Andrew: "dynamic model selection per … vector database". Each index pins
+its own embedding model; one daemon serves projects on different models.
+
+- Project `.cocoindex_code/settings.yml` may carry `embedding: {provider?,
+  model, indexing_params?, query_params?}`; absent keys inherit global.
+  Params default: global's when provider+model match global, else the
+  curated table (`voyage/*` → document/query), else none.
+- `ccc init --index-model M [--index-provider P]` writes that override
+  (also on an already-initialized project). Global `--model` unchanged.
+- Each index db records `model` (the embedder identity) and `dims` in a
+  `ccc_index_meta` table; `ccc status` prints them.
+
+1. **Two models, one daemon:** project A (global: local bge-small, 384)
+   and project B (override: `voyage/voyage-4-large` via the Worker, 1024)
+   both index and search in the same daemon; A's vec0 is `float[384]`,
+   B's is `float[1024]`; each meta row names its own model.
+2. **Refuse on mismatch:** B's override is changed to a model whose
+   initial index fails (bad bearer) → search refuses with the recorded vs
+   configured model and "run `ccc index`", never querying 1024-d vectors
+   with a different model.
+3. **Unit:** effective-settings merge (inherit / override / curated
+   params) and meta check (match, mismatch, legacy no-meta = allowed).
+   Mutation: drop the mismatch check → a test dies.
+4. **No regression:** `e2e_cli.sh` 46/0, `e2e_advanced.sh` 21/0.
+
+### POC 4b — result (2026-09-28): PASS
+
+- `src/index_model.rs`: `effective_embedding` merge, `EmbedderCache` (one
+  embedder per distinct settings, the global one seeded), `ccc_index_meta`
+  write/read, `check_compatible`. Daemon resolves the embedder per project
+  on every index/search, so a settings.yml edit applies without restart.
+- `ccc init --index-model M [--index-provider P]` pins the override
+  (`voyage/…` → provider litellm); `ccc status` prints `Index model: …`.
+- Unit 8/8 (18/18 total). `tests/mutate-index-model.sh`: 4 mutants (drop
+  mismatch check, ignore override, leak global params, refuse legacy) —
+  **all killed**.
+- Live `tests/poc4b-models.sh` **11/11**, one daemon (same pid): A
+  `float[384]` bge-small, B `float[1024]` voyage-4-large via the Worker,
+  each meta names its model; B re-pinned to voyage-code-4 → search refuses
+  naming both models; A unaffected.
+- Instrument fix, recorded: first run failed A's top-1 check — bge-small
+  ranks `handlers.py` (imports `verify_password`) above `auth.py`. The
+  pre-change binary ranks identically (measured), so A is checked top-2,
+  as `e2e_cli.sh` does for the local model. Not a regression.
+- No regression: e2e 46/0 + 21/0; POC 4 witness still 7/7.
+- Debt flagged: `daemon.rs` (775) and `main.rs` (551) were already over
+  the 300-line rule from the upstream port; +28 / +14 lines here.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

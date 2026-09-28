@@ -7,6 +7,7 @@ mod db;
 mod embedder;
 mod embedder_params;
 mod remote_embedder;
+mod index_model;
 mod indexer;
 mod mcp;
 mod project;
@@ -38,6 +39,13 @@ enum Command {
         /// Local sentence-transformers model to use (fastembed-supported).
         #[arg(long)]
         model: Option<String>,
+        /// Pin this project's index to its own embedding model (e.g.
+        /// voyage/voyage-code-4), overriding the global model.
+        #[arg(long = "index-model")]
+        index_model: Option<String>,
+        /// Provider for --index-model (inferred from a litellm prefix like voyage/).
+        #[arg(long = "index-provider", requires = "index_model")]
+        index_provider: Option<String>,
         #[arg(short = 'f', long)]
         force: bool,
     },
@@ -233,7 +241,7 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::RunDaemon => daemon::run_daemon().await?,
 
-        Command::Init { path, model, force } => {
+        Command::Init { path, model, index_model, index_provider, force } => {
             let root = match path {
                 Some(p) => p,
                 None => cwd()?,
@@ -241,6 +249,7 @@ async fn run() -> Result<()> {
             // Already initialized: still ensure global settings exist, then stop.
             if settings::project_settings_path(&root).is_file() {
                 project::init(&root, model)?;
+                project::pin_index_model(&root, index_model, index_provider)?;
                 println!("Project already initialized.");
                 return Ok(());
             }
@@ -258,6 +267,7 @@ async fn run() -> Result<()> {
                 }
             }
             let written = project::init(&root, model)?;
+            project::pin_index_model(&root, index_model, index_provider)?;
             add_to_gitignore(&root);
             println!("Created project settings: {}", written.display());
             println!("You can edit the settings files to customize indexing behavior.");
@@ -309,6 +319,9 @@ async fn run() -> Result<()> {
             let db_path = settings::target_sqlite_db_path(&root);
             if db_path.exists() {
                 println!("Index DB: {}", db_path.display());
+                if let Some(m) = project::index_meta(&db_path).await {
+                    println!("Index model: {} ({} dims)", m.model, m.dims);
+                }
             }
             let status = client::project_status(&root_str).await?;
             print_index_stats(&status);

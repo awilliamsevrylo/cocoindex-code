@@ -110,6 +110,10 @@ pub struct ProjectSettings {
     pub language_overrides: Vec<LanguageOverride>,
     #[serde(default)]
     pub chunkers: Vec<ChunkerMapping>,
+    /// Per-index embedding override (provider/model/params); absent keys
+    /// inherit the global settings. See `index_model.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<crate::index_model::ProjectEmbedding>,
 }
 
 fn default_included() -> Vec<String> {
@@ -126,6 +130,7 @@ impl Default for ProjectSettings {
             exclude_patterns: default_excluded(),
             language_overrides: Vec::new(),
             chunkers: Vec::new(),
+            embedding: None,
         }
     }
 }
