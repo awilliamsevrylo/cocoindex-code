@@ -984,3 +984,173 @@ counts are real rather than inherited cache hits.
 **Run:** installed `cccrust index`, POC 9 queries in dual mode, then the
 android-docs evaluator in primary/secondary/dual modes. Commit and push the
 criteria before any POC 11 product code starts.
+
+### POC 11d — Voyage rerank over the fused dual results (criteria before code)
+
+Andrew, verbatim: "Why don't you use the voyage re rankers on the results?
+once dumb merged". The pipeline is therefore dual search → cheap merge (RRF,
+POC 11b) → Voyage rerank of the merged top-N → final order. This slots after
+11b's fusion and before 11c's reporting; POC 11c's eval gains a 4th arm.
+
+**Measured before design (2026-09-28):**
+
+- The deployed `voyage-egress` Worker (`workers/voyage-egress/src/index.ts`,
+  85 lines) routes only `/healthz`, `/egress`, `/place`, `/placement`,
+  `/v1/embeddings`, `/v1/embeddings/query`, and `/probe`. There is **no rerank
+  route**; Voyage's `POST /v1/rerank` is unreachable through the Worker today.
+- Voyage reranker model ids live in the docs today: `rerank-3` (preview,
+  32,000-token context), `rerank-3-lite` (preview), `rerank-2.5` (32,000),
+  `rerank-2.5-lite` (32,000), plus legacy `rerank-2` (16,000), `rerank-2-lite`
+  (8,000), `rerank-1` (8,000), `rerank-lite-1` (4,000). The API reference's
+  recommended ids are `rerank-2.5` and `rerank-2.5-lite`; the preview `rerank-3`
+  family is described as highest accuracy. Default model below is
+  `rerank-2.5`, with `rerank-2.5-lite` as the latency-oriented alternative.
+- **Limits** (API reference): max **1,000 documents** per request; query max
+  **8,000 tokens** for `rerank-2.5`/`rerank-2.5-lite` (4,000 for `rerank-2`,
+  2,000 for `rerank-2-lite`/`rerank-1`); query + any single document max
+  **32,000 tokens** (16,000 / 8,000 / 4,000 for the older families); total
+  tokens per request, defined as `query_tokens × N + sum(document_tokens)`,
+  max **600,000** for `rerank-2.5`, `rerank-2.5-lite`, `rerank-2`,
+  `rerank-2-lite` (300,000 for `rerank-1`/`rerank-lite-1`). `truncation`
+  defaults to `true`; `false` raises an error instead of trimming.
+- **Wire shape.** Request `POST /v1/rerank`, `Authorization: Bearer <key>`,
+  body `{query, documents[], model, top_k?, return_documents?, truncation?}`.
+  Response `200` is `{object: "list", data: [{index, relevance_score,
+  document?}], model, usage: {total_tokens}}` with `data` sorted by descending
+  relevance; `document` appears only when `return_documents` is `true`. Errors
+  are `4xx` with `{"detail": "..."}`. The Python docs say `results`; the REST
+  field is **`data`** — parse `data`.
+- **One live call, measured** (direct `api.voyageai.com`, key path only, key
+  never printed; no Worker route was added for this): 50 documents, query
+  "how do I request a runtime permission on Android", `model=rerank-2.5`,
+  `top_k=10`, `return_documents=false` → **HTTP 200, 540 ms wall**,
+  `usage.total_tokens=1580`, 10 results returned in descending score order,
+  model echoed `rerank-2.5`, response keys `object,data,model,usage`.
+  Further repeat samples are **UNMEASURED**: `~/.drew/voyage.keys` is rewritten
+  concurrently by a key rotator (13 `pa-` lines at 14:39Z and 14:42Z, but a
+  mid-sweep iteration saw 64 tokens, and keys flap `401 Provided API key is
+  invalid`), so three follow-up attempts all returned 401. A single 50-document
+  sample of 540 ms is evidence the endpoint works and is sub-second, not a
+  p50/p95; the eval section below owns the real latency distribution.
+
+**Core design:**
+
+- New Worker route `POST /v1/rerank` in the router, dispatched through the same
+  slot Durable Objects the embeddings route uses, so rerank inherits the
+  13-key / 13-egress-IP pool, the retry/429 policy, and bearer auth. Rerank
+  calls never go direct to `api.voyageai.com` from the client; the one direct
+  call above was a measurement, not a design.
+- `rust/src/rerank.rs` (new module, <300 lines) owns the client call, request
+  building, score merge, and fallback. `main.rs`/`daemon.rs` get dispatch
+  wiring only.
+- Settings block, all fields editable in `settings.yml`:
+
+```yaml
+rerank:
+  enabled: true
+  model: voyage/rerank-2.5     # or rerank-2.5-lite for latency
+  candidates: 50               # fused results sent to Voyage
+  top_k: 10                    # results returned / shown after rerank
+  document_max_chars: 2000     # per-chunk truncation before send
+```
+
+- CLI: `--rerank` / `--no-rerank` override `rerank.enabled`, mutually
+  exclusive, like POC 11b's mode flags. Daemon `Request::Search` and the MCP
+  `search` input gain a `rerank` field; every result carries `rerank_score`
+  alongside the fused `score` and the per-index `index_matches` ranks, so a
+  row is debuggable as rerank score + fused rank + per-index ranks.
+- The documents sent are the **chunk texts** of the fused top-`candidates`
+  results, each truncated to `document_max_chars` (and to the model's
+  query+document token ceiling), preserving the fused order as the input
+  `index` mapping. Scores map back by `data[].index`.
+- `top_k` slices the reranked list; the fused order is retained for the
+  remainder and for anything beyond `candidates`.
+
+**Pass criteria:**
+
+*Worker*
+
+- [ ] A new `POST /v1/rerank` route exists and shares the slot DO dispatch with
+      `/v1/embeddings`; no second key pool, no direct client egress.
+- [ ] 429 cooldown and re-route apply exactly as they do for embeddings; a
+      mocked upstream returning 429 causes a slot cooldown and a later
+      successful attempt on another slot.
+- [ ] A 4xx from Voyage is relayed to the client with its `detail` body and
+      status, not swallowed into an empty result.
+- [ ] An oversized document set (e.g. 2,500 documents, or total tokens over
+      600,000) is split into parts that each stay within the documented limits,
+      and part scores are merged into one ranking. Split is **by documents,
+      not by query** — scores are comparable within one query, so the merge is
+      a stable sort over `(relevance_score desc, original_index asc)`.
+- [ ] Tests cover the mocked upstream (shape, 429 cooldown, 4xx relay, split
+      and merge) plus **one live call** through the deployed Worker recording
+      HTTP status, latency, and `usage.total_tokens`.
+
+*Rust core library (`rust/src/rerank.rs`, <300 lines)*
+
+- [ ] Configurable in `settings.yml` as `rerank: {enabled, model, candidates,
+      top_k}`; omitted block deserializes to disabled with the documented
+      defaults; a config round-trip test preserves every field.
+- [ ] CLI flags `--rerank` / `--no-rerank` exist, conflict with each other,
+      and are reachable from the installed `cccrust` binary with no script.
+- [ ] Daemon and MCP `search` expose the rerank switch and return
+      `rerank_score` per result; `tools/list` advertises it; msgpack/JSON
+      round-trips preserve it.
+- [ ] Chunk text is what gets sent, truncated to the configured character cap
+      and the model's token limits; a test asserts no document exceeds the cap.
+- [ ] Each returned result shows its rerank score **and** its fused rank and
+      per-index ranks; existing single-index output and the
+      `--- Result N (score: X) ---` header stay parseable.
+- [ ] All new implementation lives in `rust/src/rerank.rs` (and thin wiring);
+      no module exceeds 300 lines; `daemon.rs`/`main.rs` do not absorb rerank
+      orchestration.
+
+*Failure policy*
+
+- [ ] If rerank fails, errors, or exceeds a timeout, the response is the
+      **fused order** plus a visible warning naming the failure — never an
+      empty result, never an aborted search.
+- [ ] A test proves the fallback: a fake rerank client that errors/timeout
+      yields the fused ranking byte-identical to the no-rerank path, with the
+      warning present, and the same test with a healthy client proves rerank
+      actually reorders (positive control).
+
+*Eval (POC 11c gains a 4th arm)*
+
+- [ ] `~/PROJECTS/agent-skills/skills/android-docs/eval/run.mjs` runs a 4th
+      mode, `dual+rerank`, and the report prints `n`, hit@1, and hit@5 per
+      query style and overall for all four modes. The current single-index
+      baseline in
+      `~/PROJECTS/agent-skills/skills/android-docs/eval/results.tsv` is
+      **59/106 hit@5, 35/106 hit@1**, error-string style **3/12**; the six
+      control rows must remain 6/6 hit@5 or the runner is invalid.
+- [ ] **PASS** if `dual+rerank hit@1 > baseline hit@1 (35/106)`. Report the
+      result honestly either way — a lower number is a retained measurement,
+      not a reason to move the gate.
+- [ ] The report also lists every per-style regression of dual+rerank versus
+      the best of the four arms, even when the overall gate passes.
+- [ ] Added latency per query is reported as **p50 and p95**, and rerank
+      tokens per query (from `usage.total_tokens`) are reported alongside
+      them.
+
+*Cost note*
+
+- Per-query rerank cost is exactly `Q×N + sum(chunk_tokens)` where `Q` is
+  query tokens, `N = rerank.candidates`, and each chunk is truncated to the
+  configured cap. The measured 50-document, ~30-token-document call cost
+  **1,580 total tokens** in 540 ms. At a 2,000-character cap (~500 tokens per
+  chunk) and `N=50` that is ≈ **25,000 tokens per query** (50 × 500 + ~10 query),
+  still far under the 600,000 ceiling; at `N=100` it doubles.
+- Recommended default: `candidates: 50`, `document_max_chars: 2000`. If the
+  measured rerank p95 in the eval above exceeds **1.5 s**, lower `candidates`
+  to 25 (halving both tokens and latency) rather than shortening chunks;
+  re-measure before changing anything else.
+
+**Run:** `cargo test rerank` plus the Worker's mocked-upstream tests, one live
+`POST /v1/rerank` through the deployed Worker, and the android-docs evaluator
+in four modes. Scripts may format the evidence; they are not the
+implementation or the pass authority.
+
+**Gate:** POC 11d criteria are committed here before any POC 11d product code
+starts. POC 11c may report its three existing arms without waiting for 11d;
+the dual+rerank arm is 11d's own eval step.
