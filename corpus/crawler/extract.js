@@ -59,18 +59,34 @@
     return { md: `# ${(art.title || '').trim()}\n\n${td.turndown(holder).trim()}`, via: 'readability' };
   }
 
+  // The devsite article: <article ... class="... devsite-article ...">, searched
+  // only AFTER </head> so an `<article` string inside a head <script> never
+  // counts. Nested <article> elements are depth-counted to the matching close.
+  // Anything unexpected returns the FULL page (slower, never truncated).
+  const DEVSITE_ARTICLE = /<article\b[^>]*\bclass=["'](?:[^"']*\s)?devsite-article(?:\s[^"']*)?["']/i;
   function slim(html) {
-    const a = html.indexOf('<article');
-    const z = a < 0 ? -1 : html.indexOf('</article>', a);
     const h = html.indexOf('</head>');
-    if (a < 0 || z < 0 || h < 0) return html; // no article: Readability needs the full page
-    return `${html.slice(0, h + 7)}<body>${html.slice(a, z + 10)}</body></html>`;
+    if (h < 0) return html;
+    const m = DEVSITE_ARTICLE.exec(html.slice(h));
+    if (!m) return html; // no devsite article: Readability needs the full page
+    const a = h + m.index;
+    const tag = /<(\/?)article\b[^>]*>/gi;
+    tag.lastIndex = a;
+    let depth = 0, t;
+    while ((t = tag.exec(html))) {
+      depth += t[1] ? -1 : 1;
+      if (depth === 0) {
+        const z = t.index + t[0].length;
+        return `${html.slice(0, h + 7)}<body>${html.slice(a, z)}</body></html>`;
+      }
+    }
+    return html; // unbalanced: parse the whole page rather than truncate
   }
 
   async function one(url) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const r = await fetch(url, { credentials: 'omit', redirect: 'follow' });
+        const r = await fetch(url, { credentials: 'omit', redirect: 'follow', signal: AbortSignal.timeout(30000) });
         if (r.status === 429 || r.status >= 500) {
           await new Promise((res) => setTimeout(res, 2000 * (attempt + 1)));
           continue;
