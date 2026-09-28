@@ -1,0 +1,13 @@
+{
+  "name": "aosp-docs",
+  "lanes": 5,
+  "image": "node:22-slim",
+  "items": "aosp-docs-items.txt",
+  "setup": { "file": "aosp-docs-setup.sh" },
+  "worker": "WORK_DIR=/tmp/aosp-sweep-work bash /tmp/home/ccc/corpus/aosp/sweep.sh",
+  "sync": "rclone --config \"$HOME/rclone.conf\" copy \"$OUT_DIR\" \"wasabimb:drew-aosp-docs-20260928/aosp-docs-v2/$LANE/\" --transfers 16 --checkers 16",
+  "syncEverySec": 300,
+  "collect": "rclone --config \"$HOME/.drew/rclone-wasabimb.conf\" copy wasabimb:drew-aosp-docs-20260928/aosp-docs-v2 \"$HOME/PROJECTS/aosp-docs/aosp-docs-v2\" --exclude MANIFEST.tsv --transfers 32 --checkers 32",
+  "env": { "CLONE_RETRIES": "3" },
+  "uploads": { "rclone.conf": "~/.drew/rclone-wasabimb.conf" }
+}
