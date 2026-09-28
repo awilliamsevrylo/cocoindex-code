@@ -6,6 +6,7 @@ mod daemon_paths;
 mod db;
 mod embedder;
 mod embedder_params;
+mod remote_embedder;
 mod indexer;
 mod mcp;
 mod project;

@@ -23,8 +23,9 @@ SOCKS leases:
   best-effort, not unique — one collision in 24 calls seen then.
 - `api.voyageai.com` = 136.110.181.169, `via: 1.1 google` — not a Cloudflare
   IP, so `connect()` is permitted (Workers block sockets to CF ranges only).
-- Rust `ccc` becomes a thin client: engine `ApiEmbedder` with `base_url` =
-  the Worker. SOCKS, key pool and lease client leave the Rust scope.
+- Rust `ccc` becomes a thin client with `base_url` = the Worker. SOCKS, key
+  pool and lease client leave the Rust scope. (Revised in POC 4: ccc's own
+  `RemoteEmbedder`, not the engine `ApiEmbedder`, which drops `input_type`.)
 
 Worker source: `workers/voyage-egress/` on this branch.
 
@@ -34,7 +35,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 1 | DO `connect()`+TLS returns a real Voyage vector; egress witnessed | PASS | 7/7 live; dims 1024; egress 104.28.166.239; parser 6/6 + mutation teeth |
 | 2 | 13 named DOs = 13 distinct sticky IPs; collision fails closed | PASS | run 1 caught 00/04/05 collision; placement re-homed 04,05 → 4/4, 65 calls 0 err |
 | 3 | `/v1/embeddings` router: token budget, per-slot 429 cooldown | PASS | unit 6/6, 4/4 mutants killed; live 9/9 incl. retrieval sanity |
-| 4 | Rust `ccc` indexes + searches through the Worker | — | |
+| 4 | Rust `ccc` indexes + searches through the Worker | PASS | unit 6/6, 4/4 mutants killed; live 7/7 (dims 1024, auth.py top hit); e2e 46/0 + 21/0 |
 | 5 | client in-flight requests bounded | — | |
 | 6 | re-run never re-embeds finished chunks | — | |
 | 7 | fault suite (429, oversize, slow) has teeth | — | |
@@ -181,6 +182,48 @@ stripped before calling Voyage.
 - First live run failed 7/9 with `not_found`: the new route was not yet
   being served right after deploy. Fix is in the instrument: gate on the
   route under test (empty body → handler's 400), not on `/healthz`.
+
+## POC 4 — pass criteria (written before code)
+
+`provider: litellm` (the Python config shape) now builds a remote embedder
+in ccc: `POST {base}/embeddings` with `{model, input, ...params}`, so the
+existing `indexing_params: {input_type: document}` / `query_params:
+{input_type: query}` reach the Worker unchanged. Base URL from
+`CCC_EMBED_BASE_URL` (default `https://api.voyageai.com/v1`), bearer from
+`CCC_EMBED_API_KEY_FILE` / `CCC_EMBED_API_KEY` / `VOYAGE_API_KEY`. Engine
+`ApiEmbedder` is not used: it cannot send `input_type`.
+
+1. **Params reach the wire (unit, mock HTTP):** indexing call body carries
+   `input_type:"document"`, query call carries `"query"`, `model` verbatim.
+   Mutation: drop the params merge → that test dies.
+2. **Index through the Worker:** `ccc index` on the sample fixture exits 0,
+   chunks > 0; the vec0 table is declared `float[1024]`.
+3. **Search through the Worker:** `ccc search "verify password"` top hit is
+   `src/auth.py`.
+4. **Fail loud:** a wrong bearer makes `ccc index` report the 401, never a
+   silent 0-chunk success.
+5. **No regression:** local `sentence-transformers` path — `e2e_cli.sh`
+   still 46/0.
+
+### POC 4 — result (2026-09-28): PASS, first attempt
+
+- `src/remote_embedder.rs` (`provider: litellm`) + `CodeEmbedder` is now an
+  enum over local fastembed | remote. The indexer embeds with the resolved
+  `indexing_params` (it passed an empty map before, so `input_type` was
+  never sent). The response is re-ordered by `index`, and a short response
+  is an error — never a vector shifted onto the wrong chunk.
+- Unit 6/6 (one-shot local HTTP mock reads the real wire body).
+  `tests/mutate-remote-embedder.sh`: 4 mutants (drop params merge, ignore
+  response index, drop length check, keep `voyage/` prefix) — **all
+  killed**, survivors=0.
+- Live `tests/poc4-worker.sh` **7/7** against the deployed Worker: wrong
+  bearer → index surfaces the 401 (rc=1) without echoing the token; index
+  rc=0, 5 chunks, vec0 DDL `float[1024]`; "verify password" → `src/auth.py`,
+  "request handler dispatch" → `src/handlers.py`.
+- No regression: `e2e_cli.sh` 46/0, `e2e_advanced.sh` 21/0 (local fastembed).
+- `state_key` is `litellm:<model>`; the endpoint is excluded on purpose
+  (Worker and direct Voyage are the same vectors). Model changes still
+  re-embed; per-index model pinning is POC 4b.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

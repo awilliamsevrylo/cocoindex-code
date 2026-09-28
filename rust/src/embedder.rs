@@ -1,43 +1,65 @@
 //! Embedder backend. Ports `shared.create_embedder`.
 //!
-//! Only **local sentence-transformers** (fastembed) is supported right now.
-//! The Python tool also offers a `litellm` provider for cloud/multi-provider
-//! embeddings; there is no in-process Rust equivalent (the community
-//! `litellm-rust` crate is alpha and only covers OpenAI-compatible endpoints),
-//! so that option is intentionally not exposed yet. `create_embedder` parses
-//! existing `provider: litellm` configs without panicking and returns a clear
-//! error pointing users at the local provider — keeping settings files
-//! backward compatible.
+//! Two providers:
+//! - `sentence-transformers`: local fastembed model (in-process).
+//! - `litellm`: a remote OpenAI-compatible `/embeddings` endpoint
+//!   ([`RemoteEmbedder`]) — Voyage directly, or the voyage-egress Worker that
+//!   spreads calls across pinned-IP keys. Only the endpoint shape is shared
+//!   with Python's litellm; there is no multi-provider router here.
+//!
+//! Indexing and query calls carry their own resolved params, so Voyage's
+//! `input_type: document|query` from `indexing_params`/`query_params` reaches
+//! the wire.
 
 use anyhow::{Result, anyhow, bail};
 
 use crate::embedder_params::Params;
+use crate::remote_embedder::RemoteEmbedder;
 use crate::settings::EmbeddingSettings;
 
 /// Legacy model-name prefix (`sbert/…`) stripped before loading, matching the
 /// Python embedder. Kept for backward compatibility with older configs.
 const SBERT_PREFIX: &str = "sbert/";
 
-/// The embedding backend. Currently always a local fastembed model.
+#[derive(Clone)]
+enum Backend {
+    Local(cocoindex::ops::sentence_transformers::SentenceTransformerEmbedder),
+    Remote(RemoteEmbedder),
+}
+
+/// The embedding backend plus the indexing params it was built with.
 #[derive(Clone)]
 pub struct CodeEmbedder {
-    inner: cocoindex::ops::sentence_transformers::SentenceTransformerEmbedder,
+    backend: Backend,
+    indexing_params: Params,
 }
 
 impl CodeEmbedder {
     /// Stable identity for change detection (parity for Python's
-    /// `ContextKey(..., detect_change=True)` keyed on the embedder).
+    /// `ContextKey(..., detect_change=True)` keyed on the embedder). The
+    /// endpoint is deliberately not part of it: the Worker and direct Voyage
+    /// return the same vectors for the same model.
     pub fn state_key(&self) -> String {
-        format!("sentence-transformers:{}", self.inner.model_name())
+        match &self.backend {
+            Backend::Local(e) => format!("sentence-transformers:{}", e.model_name()),
+            Backend::Remote(e) => format!("litellm:{}", e.model()),
+        }
     }
 
-    pub async fn embed_batch(&self, texts: Vec<String>, _params: &Params) -> Result<Vec<Vec<f32>>> {
-        // NOTE: `prompt_name` (query vs passage) is not yet threaded through the
-        // SDK embedder; tracked as a parity follow-up.
-        self.inner
-            .embed_batch(texts)
-            .await
-            .map_err(|e| anyhow!("local embed failed: {e}"))
+    pub async fn embed_batch(&self, texts: Vec<String>, params: &Params) -> Result<Vec<Vec<f32>>> {
+        match &self.backend {
+            // NOTE: `prompt_name` (query vs passage) is not yet threaded through
+            // the SDK's local embedder; tracked as a parity follow-up.
+            Backend::Local(e) => {
+                e.embed_batch(texts).await.map_err(|e| anyhow!("local embed failed: {e}"))
+            }
+            Backend::Remote(e) => e.embed_batch(texts, params).await,
+        }
+    }
+
+    /// Embed chunks for the index, with the configured `indexing_params`.
+    pub async fn embed_for_indexing(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch(texts, &self.indexing_params).await
     }
 
     pub async fn embed(&self, text: &str, params: &Params) -> Result<Vec<f32>> {
@@ -45,35 +67,40 @@ impl CodeEmbedder {
         out.pop().ok_or_else(|| anyhow!("embedder returned no vectors"))
     }
 
-    /// The embedding dimension (exact, from the loaded model).
+    /// The embedding dimension (exact: from the loaded model, or probed once
+    /// against the remote endpoint with the indexing params).
     pub async fn dimension(&self) -> Result<usize> {
-        Ok(self.inner.dimension())
+        match &self.backend {
+            Backend::Local(e) => Ok(e.dimension()),
+            Backend::Remote(e) => e.dimension(&self.indexing_params).await,
+        }
     }
 }
 
-/// Build an embedder from settings. Only `provider: sentence-transformers`
-/// (local fastembed) is supported; any other provider is rejected with a clear
-/// message rather than silently failing.
+/// Build an embedder from settings.
 pub async fn create_embedder(
     settings: &EmbeddingSettings,
-    _indexing_params: &Params,
+    indexing_params: &Params,
 ) -> Result<CodeEmbedder> {
-    if settings.provider != "sentence-transformers" {
-        bail!(
-            "Only local 'sentence-transformers' (fastembed) embeddings are supported in the Rust \
-             port right now — provider '{}' is not available. Set `provider: sentence-transformers` \
-             in {} and choose a fastembed-supported model.",
-            settings.provider,
+    let backend = match settings.provider.as_str() {
+        "sentence-transformers" => {
+            let mut model = settings.model.clone();
+            if let Some(stripped) = model.strip_prefix(SBERT_PREFIX) {
+                model = stripped.to_string();
+            }
+            let inner =
+                cocoindex::ops::sentence_transformers::SentenceTransformerEmbedder::load(&model)
+                    .await
+                    .map_err(|e| anyhow!("loading sentence-transformers model {model:?}: {e}"))?;
+            Backend::Local(inner)
+        }
+        "litellm" => Backend::Remote(RemoteEmbedder::from_env(&settings.model)?),
+        other => bail!(
+            "Embedding provider '{other}' is not supported by the Rust port. Use \
+             `provider: sentence-transformers` (local fastembed) or `provider: litellm` \
+             (remote OpenAI-compatible endpoint; set CCC_EMBED_BASE_URL) in {}.",
             crate::settings::user_settings_path().display()
-        );
-    }
-
-    let mut model = settings.model.clone();
-    if let Some(stripped) = model.strip_prefix(SBERT_PREFIX) {
-        model = stripped.to_string();
-    }
-    let inner = cocoindex::ops::sentence_transformers::SentenceTransformerEmbedder::load(&model)
-        .await
-        .map_err(|e| anyhow!("loading sentence-transformers model {model:?}: {e}"))?;
-    Ok(CodeEmbedder { inner })
+        ),
+    };
+    Ok(CodeEmbedder { backend, indexing_params: indexing_params.clone() })
 }

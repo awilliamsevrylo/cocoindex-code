@@ -13,7 +13,6 @@ use cocoindex::RunStats;
 use cocoindex::sqlite::{self, ColumnDef, SqliteTableOptions, TableSchema, Vec0TableDef};
 
 use crate::embedder::CodeEmbedder;
-use crate::embedder_params::Params;
 use crate::schema::{CodeChunk, TABLE_NAME};
 use crate::settings::{ProjectSettings, UserSettings};
 
@@ -100,7 +99,7 @@ async fn process_file(ctx: &Ctx, file: FileEntry, model_tag: String) -> Result<V
     let codes: Vec<String> = chunks.iter().map(|c| c.text(&content).to_string()).collect();
     let embedder = ctx.get_key(&EMBEDDER)?;
     let embeddings = embedder
-        .embed_batch(codes.clone(), &Params::new())
+        .embed_for_indexing(codes.clone())
         .await
         .map_err(|e| Error::engine(format!("embed: {e}")))?;
 

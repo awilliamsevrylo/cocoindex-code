@@ -544,6 +544,7 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "regex",
+ "reqwest",
  "rmp-serde",
  "serde",
  "serde_json",
