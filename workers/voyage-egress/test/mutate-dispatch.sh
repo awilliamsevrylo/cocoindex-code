@@ -33,5 +33,8 @@ mutant per-request-sched 's/      const slot = await sched\.acquire\(/      sche
 mutant no-slot-cap   's/if \(this\.load\(s\) >= this\.perSlot\) continue;/void 0;/' 'void 0;' src/scheduler.ts
 mutant leak-permit   's/\} finally \{\n        sched\.release\(slot\);\n      \}/} finally {}\n      sched.release(slot);/' 'finally {}' src/dispatch.ts
 
+mutant no-oversize-split "s/if \\(r\\.status === 400 && idx\\.length > 1 && TOO_BIG\\.test\\(r\\.error \\?\\? ''\\)\\) \\{/if (false) {/" "if (false) {"
+mutant plain-error    's/throw new UpstreamError\(r\.status, /throw new Error(/' 'throw new Error(.voyage'
+
 echo "survivors=$survivors"
 [ "$survivors" = "0" ]

@@ -5,7 +5,7 @@
 // a request (and later requests on the same isolate) away from it.
 import type { Env } from './slot';
 import type { SlotHome } from './placement';
-import { dispatch, NoHealthySlot, SlotScheduler } from './dispatch';
+import { dispatch, NoHealthySlot, SlotScheduler, UpstreamError } from './dispatch';
 
 const cooldownUntil = new Map<number, number>();
 // Module scope: shared by every request this isolate serves, so concurrent
@@ -65,6 +65,9 @@ export async function handleEmbeddings(
     });
   } catch (e) {
     if (e instanceof NoHealthySlot) return json({ error: 'no_healthy_slot' }, 503);
+    if (e instanceof UpstreamError && e.status >= 400 && e.status < 500) {
+      return json({ error: e.message.slice(0, 300) }, e.status);
+    }
     return json({ error: String((e as Error).message ?? e).slice(0, 300) }, 502);
   }
 }

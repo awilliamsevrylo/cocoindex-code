@@ -6,7 +6,22 @@ import { NoHealthySlot, SlotScheduler } from './scheduler.ts';
 
 export { NoHealthySlot, SlotScheduler };
 
-export const MAX_TOKENS_PER_CALL = 120_000; // only measured Voyage limit
+// An upstream client error, carried with its status so the router can
+// relay it (a 400 must stay a 400, or clients retry what cannot succeed).
+export class UpstreamError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const TOO_BIG = /max allowed tokens|too many tokens|batch has \d+ tokens|lower the number of tokens/i;
+
+// Voyage rejects > 120,000 real tokens per batch. The 3 chars/token estimate
+// under-counts dense API reference text (measured 126,899 real for a 120K
+// estimate), so budget 100K and split on the 400 if it still overshoots.
+export const MAX_TOKENS_PER_CALL = 100_000;
 export const MAX_INPUTS_PER_CALL = 1_000;
 const CHARS_PER_TOKEN = 3; // conservative (English ≈ 4); over-splits, never under
 
@@ -91,7 +106,12 @@ export async function dispatch(
         rerouted++;
         continue;
       }
-      throw new Error(`voyage ${r.status}: ${(r.error ?? '').slice(0, 200)}`);
+      if (r.status === 400 && idx.length > 1 && TOO_BIG.test(r.error ?? '')) {
+        const mid = Math.floor(idx.length / 2);
+        await Promise.all([runBatch(idx.slice(0, mid)), runBatch(idx.slice(mid))]);
+        return;
+      }
+      throw new UpstreamError(r.status, `voyage ${r.status}: ${(r.error ?? '').slice(0, 200)}`);
     }
     throw new NoHealthySlot('no_healthy_slot');
   };

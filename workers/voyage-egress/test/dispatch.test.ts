@@ -1,7 +1,7 @@
 // Unit tests for the /v1/embeddings dispatch core with fake slots.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { dispatch, makeBatches, NoHealthySlot, type SlotCall } from '../src/dispatch.ts';
+import { dispatch, makeBatches, NoHealthySlot, UpstreamError, type SlotCall } from '../src/dispatch.ts';
 
 // Fake slot: vector = [slot, charCodeOf(first char)] so order + origin are visible.
 const echo: SlotCall = async (slot, batch) => ({
@@ -52,4 +52,26 @@ test('all slots cooling down fails closed with no_healthy_slot', async () => {
 test('non-retryable 4xx surfaces instead of re-routing', async () => {
   const bad: SlotCall = async () => ({ status: 400, error: 'bad model' });
   await assert.rejects(dispatch(['a'], [0, 1], bad, new Map()), /voyage 400/);
+});
+
+test('a batch Voyage rejects as over the token limit is split, order kept', async () => {
+  // Fake Voyage: rejects any batch of more than 3 inputs with its real message.
+  const picky: SlotCall = async (slot, batch) =>
+    batch.length > 3
+      ? { status: 400, error: `The max allowed tokens per submitted batch is 120000. Your batch has ${batch.length * 50000} tokens` }
+      : echo(slot, batch);
+  const input = Array.from({ length: 10 }, (_, i) => String.fromCharCode(65 + i));
+  const r = await dispatch(input, [0, 1, 2], picky, new Map());
+  r.vectors.forEach((v, i) => assert.equal(v[1], 65 + i, `index ${i} out of order`));
+});
+
+test('a single oversize input is not split forever', async () => {
+  const always: SlotCall = async () => ({ status: 400, error: 'Your batch has 130000 tokens' });
+  await assert.rejects(dispatch(['huge'], [0], always, new Map()), (e: unknown) => (e as UpstreamError).status === 400);
+});
+
+test('other Voyage 4xx keep their status for the router to relay', async () => {
+  const bad: SlotCall = async () => ({ status: 400, error: 'model not found' });
+  await assert.rejects(dispatch(['a', 'b'], [0, 1], bad, new Map()), (e: unknown) =>
+    e instanceof UpstreamError && e.status === 400);
 });
