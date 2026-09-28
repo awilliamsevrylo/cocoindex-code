@@ -1,0 +1,17 @@
+{
+  // DO-only script. House rule: one Durable Object class per script, so a
+  // router redeploy never re-instantiates the slots (and never moves their
+  // sticky connect() egress IPs). Account comes from CLOUDFLARE_ACCOUNT_ID.
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "voyage-slot",
+  "main": "entry.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": false,
+  "exports": {
+    "VoyageSlot": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "VOYAGE_SLOT", "class_name": "VoyageSlot" }]
+  },
+  "observability": { "enabled": true }
+}

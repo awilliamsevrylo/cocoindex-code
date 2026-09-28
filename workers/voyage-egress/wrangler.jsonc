@@ -1,0 +1,15 @@
+{
+  // Router script: auth + dispatch only. Binds to the VoyageSlot class that
+  // lives in the separate "voyage-slot" script (one DO class per script).
+  // Account comes from CLOUDFLARE_ACCOUNT_ID at deploy time.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "voyage-egress",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "VOYAGE_SLOT", "class_name": "VoyageSlot", "script_name": "voyage-slot" }
+    ]
+  },
+  "observability": { "enabled": true }
+}
