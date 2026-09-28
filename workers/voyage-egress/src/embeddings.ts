@@ -10,6 +10,7 @@ import { dispatch, NoHealthySlot, UpstreamError } from './dispatch.ts';
 // rerank.ts: at most POOL_PER_SLOT calls per Voyage key across both routes,
 // and a cooldown learned on either route benches the slot for both.
 import { sharedPool } from './pool.ts';
+import { streamEmbeddingsResponse } from './stream-json.ts';
 
 const { scheduler, cooldownUntil } = sharedPool();
 
@@ -57,9 +58,8 @@ export async function handleEmbeddings(
       Date.now,
       scheduler,
     );
-    return json({
-      object: 'list',
-      data: r.vectors.map((embedding, index) => ({ object: 'embedding', index, embedding })),
+    return streamEmbeddingsResponse({
+      vectors: r.vectors,
       model: body.model,
       usage: { prompt_tokens: r.usage_tokens, total_tokens: r.usage_tokens },
       voyage_egress: { calls: r.calls, rerouted: r.rerouted, slots: r.slots },
