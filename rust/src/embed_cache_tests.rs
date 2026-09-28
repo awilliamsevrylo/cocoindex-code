@@ -10,6 +10,10 @@ use tokio::net::TcpListener;
 use super::*;
 use crate::embed_cache::{EmbedCache, cache_key};
 
+#[cfg(test)]
+#[path = "embed_cache_robust_tests.rs"]
+mod robust;
+
 /// Mock that answers every request (echoing one vector per input, derived
 /// from the text length) and counts the inputs it was sent — the "spend".
 async fn spend_mock() -> (String, Arc<AtomicUsize>) {
