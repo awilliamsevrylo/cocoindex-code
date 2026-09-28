@@ -1,0 +1,12 @@
+// POC 12.1 throwaway caller: proves the EmbedRPC named entrypoint over a
+// service binding. Deleted after the live proof — never deployed long-term.
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "voyage-egress-rpc-caller",
+  "main": "src.ts",
+  "compatibility_date": "2026-09-01",
+  "services": [
+    { "binding": "EGRESS", "service": "voyage-egress", "entrypoint": "EmbedRPC" }
+  ],
+  "observability": { "enabled": true }
+}
