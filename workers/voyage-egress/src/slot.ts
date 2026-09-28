@@ -40,6 +40,20 @@ export function slotCount(keys: string): number {
 }
 
 export class VoyageSlot extends DurableObject<SlotEnv> {
+  // Small JSON store. Only the reserved placement instance uses it; key
+  // slots never store anything, so no key material ever touches storage.
+  async getJson<T>(key: string): Promise<T | null> {
+    return (await this.ctx.storage.get<T>(key)) ?? null;
+  }
+
+  async putJson(key: string, value: unknown): Promise<void> {
+    await this.ctx.storage.put(key, value);
+  }
+
+  async keyCount(): Promise<number> {
+    return slotCount(this.env.VOYAGE_KEYS);
+  }
+
   // Egress witness: non-Cloudflare echo host over the same connect() path the
   // Voyage calls use. ipify/ifconfig.me are Cloudflare-fronted and misreport.
   async egressIp(): Promise<string> {

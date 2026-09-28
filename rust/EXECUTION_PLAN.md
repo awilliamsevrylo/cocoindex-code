@@ -32,7 +32,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 |---|---|---|---|
 | 0 | port builds + e2e passes on a pinned engine | PASS | engine `3b617ff`; e2e_cli 46/0, e2e_advanced 21/0, cargo test 4/4 |
 | 1 | DO `connect()`+TLS returns a real Voyage vector; egress witnessed | PASS | 7/7 live; dims 1024; egress 104.28.166.239; parser 6/6 + mutation teeth |
-| 2 | 12 named DOs = 12 distinct sticky IPs; collision fails closed | — | |
+| 2 | 13 named DOs = 13 distinct sticky IPs; collision fails closed | PASS | run 1 caught 00/04/05 collision; placement re-homed 04,05 → 4/4, 65 calls 0 err |
 | 3 | `/v1/embeddings` router: token budget, per-slot 429 cooldown | — | |
 | 4 | Rust `ccc` indexes + searches through the Worker | — | |
 | 5 | client in-flight requests bounded | — | |
@@ -98,3 +98,51 @@ Traps hit and recorded:
   through a pipe; typecheck gated on the unpiped exit code.
 - Node 24 `node --test` uses the spec reporter; count lines only appear
   with `--test-reporter=tap`.
+
+## POC 2 — pass criteria (written before code)
+
+New route `GET /egress?slot=NN` (bearer): the slot DO `connect()`s
+checkip.amazonaws.com and returns its IP. Zero Voyage spend.
+
+1. **Sticky:** 12 slots x 5 rounds, interleaved (round-robin across slots
+   each round, so time/ordering cannot explain the result). Every slot
+   reports exactly 1 distinct IP across its 5 calls.
+2. **Distinct:** the 12 slots report 12 different IPs.
+3. **Positive control (instrument has teeth):** 5 calls to 5 fresh,
+   never-used DO names (`probe-<random>`) must report >1 distinct IP. If
+   fresh names all share one IP, the instrument cannot tell distinct from
+   shared and criteria 1–2 prove nothing.
+4. **Fail closed on collision:** if two slots share an IP, the witness
+   prints the colliding slot ids and exits non-zero. (Runtime refusal of a
+   collided slot's key is POC 3's router job; POC 2 proves detection.)
+
+Collision fallback, if criterion 2 fails: re-home the colliding slot to a
+new DO name (`voyage-key-NN-bK`) and re-measure. The name-to-key mapping
+then lives in a small persisted table, not the name format.
+
+### POC 2 — result (2026-09-28): PASS after the planned fallback
+
+Run 1 (12 slots, base names): control PASS (4/5 distinct), sticky PASS,
+**distinct FAIL — 10/12**, slots 00, 04, 05 all on 104.28.166.239. The
+instrument caught a real collision, so the fallback ran as written:
+
+- `src/placement.ts` `assignDistinct()` — earlier slots keep priority, a
+  colliding slot walks `-b1`, `-b2`…; a slot with no free IP is reported
+  **unresolved, never shared**. Pinned in the reserved `voyage-placement`
+  instance of the same DO class (still one class per script).
+- Unit tests 4/4 (10/10 with parser). Mutation: drop `!taken.has(ip)` →
+  3 tests die ("collision re-homes…", "every placed IP is unique",
+  "…unresolved, never shared") → TEETH OK.
+- Key 13 added 2026-09-28 (Andrew: large voyage-4 quota), backup
+  `~/.drew/voyage.keys.bak-20260928-052706`; secret now 13 keys.
+
+`POST /place` → 13 slots, unresolved `[]`; 04 → `-b1` 104.28.165.17,
+05 → `-b1` 104.28.160.66. Re-witness `SLOTS=13 PINNED=1
+test/poc2-egress.sh` → **4/4 PASS**: control 5/5 distinct, 65 calls 0
+errors, sticky 13/13, **distinct 13/13**.
+
+Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
+fresh control DOs landed on IPs key slots also hold. IPs are not reserved
+and a DO can relocate after eviction, so the router must re-check a slot's
+egress IP periodically and refuse a slot whose IP now collides — placement
+is a snapshot, not a guarantee.
