@@ -1,9 +1,11 @@
 //! `cccrust` — Rust port of cocoindex-code. Daemon-backed CLI.
 
+mod cached_embed;
 mod client;
 mod daemon;
 mod daemon_paths;
 mod db;
+mod embed_cache;
 mod embedder;
 mod embedder_params;
 mod remote_embedder;
@@ -14,6 +16,7 @@ mod project;
 mod protocol;
 mod query;
 mod schema;
+mod single_flight;
 mod settings;
 mod walk;
 

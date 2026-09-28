@@ -94,7 +94,7 @@ pub async fn create_embedder(
                     .map_err(|e| anyhow!("loading sentence-transformers model {model:?}: {e}"))?;
             Backend::Local(inner)
         }
-        "litellm" => Backend::Remote(RemoteEmbedder::from_env(&settings.model)?),
+        "litellm" => Backend::Remote(RemoteEmbedder::from_env_cached(&settings.model).await?),
         other => bail!(
             "Embedding provider '{other}' is not supported by the Rust port. Use \
              `provider: sentence-transformers` (local fastembed) or `provider: litellm` \

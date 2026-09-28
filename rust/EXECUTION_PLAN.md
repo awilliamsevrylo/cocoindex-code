@@ -39,7 +39,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 4b | per-index model: two models, one daemon; mismatch refused | PASS | unit 8/8, 4/4 mutants killed; live 11/11 (384 + 1024 in one daemon) |
 | 4c | renamed `cccrust`; own `~/.cccrust` + `.cccrust/`; never reads Python config | PASS | isolation 7/7 incl. poison control; e2e 46/0 + 21/0 |
 | 5 | client in-flight bounded; Worker spreads load across slots | PASS | 1K files peak 8 (control 732); live 26 reqs → 13/13 slots, 2 each; 7/7 + 5/5 mutants |
-| 6 | re-run never re-embeds finished chunks | — | |
+| 6 | re-run never re-embeds finished chunks | PASS | reset re-run spend 0 (control 200); kill -9 resume 403/403 limit; 100 identical files → 2; 4/4 mutants |
 | 7 | fault suite (429, oversize, slow) has teeth | — | |
 | 8 | measured throughput picks slot count | — | |
 | 9 | Android docs corpus fully indexed | — | |
@@ -377,6 +377,56 @@ Instrument trap found and fixed: the Rust mutation scripts restored the
 source with `mv`, which puts back an OLDER mtime, so cargo kept the
 mutant's build — a clean `cargo test` then failed with peak 64. Both
 scripts now `touch` after restoring.
+
+## POC 6 — pass criteria (written before code)
+
+The ledger is a content-addressed vector cache in `RemoteEmbedder`: key =
+sha256(model, params, text) → f32 vector, in `~/.cccrust/embed_cache.db`
+(SQLite, WAL), written as soon as each HTTP batch returns. Checked before
+every call, so it covers crash-resume, `reset` + re-index, identical chunks
+across files, and duplicates inside one batch. The engine's per-file memo
+is unchanged. `CCC_EMBED_CACHE=off` disables it (the control).
+
+Witness against the local mock, which counts inputs it receives (the
+"spend"):
+
+1. **Re-run pays zero:** index 200 unique files → mock inputs = 200 (+1
+   dimension probe). `cccrust reset -f` (drops the project dbs AND the
+   engine memo) and index again → **0** inputs; 200 files still indexed.
+2. **Control:** same with `CCC_EMBED_CACHE=off` → the second run pays
+   ≥ 200 again, so the counter can see spend.
+3. **Crash mid-run:** 400 files, mock holds 60 ms, cap 2; `kill -9` the
+   daemon partway; index again to completion → inputs over BOTH runs
+   ≤ 400 + 1 + cap (only batches in flight at the kill are paid twice),
+   and all 400 files indexed.
+4. **Dedupe across files:** 100 files with identical content → inputs
+   ≤ 2 (one text + the probe).
+5. **Unit:** the key changes with model, params and text; a cache hit
+   makes no HTTP call; duplicates in one batch are sent once. Mutation:
+   drop the lookup → dies; drop params from the key → dies.
+
+### POC 6 — result (2026-09-28): PASS after one revision
+
+- `src/embed_cache.rs` (sha256 length-prefixed key → LE f32 blob, SQLite
+  WAL at `~/.cccrust/embed_cache.db`), `src/cached_embed.rs` (lookup →
+  claim → fetch owned → write-through → wait), `src/single_flight.rs`.
+- **Revision:** first witness run failed criterion 4 — 100 identical files
+  paid **101**. The cache was right but every file missed at the same
+  moment (all concurrent). Added single-flight: the first caller of a key
+  fetches it, concurrent callers wait on its result; a failed fetch wakes
+  waiters empty-handed and they fetch for themselves. The same mechanism
+  covers duplicates inside one batch, so the separate check was removed.
+- `tests/poc6-ledger.sh` **6/6** (mock counts inputs = spend):
+  first run 201 (200 + probe); after `cccrust reset -f` **0**, 200 files;
+  control `CCC_EMBED_CACHE=off` re-run **200**; 100 identical files
+  **2**; `kill -9` of the daemon after 104 of 400 → resume total **403**
+  (limit 400 + 1 + cap 2), 400/400 files.
+- Unit 27/27. `tests/mutate-embed-cache.sh` 4/4 killed (params dropped
+  from key, no length prefix, skipped lookup, no single-flight). The
+  script now refuses a non-compiling mutant as a dead instrument (one
+  first draft "survived" only because it did not compile).
+- Regression: e2e 46/0 + 21/0, POC 4 7/7, 4b 11/11, 4c 7/7, 5 4/4, all
+  mutation scripts survivors=0.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

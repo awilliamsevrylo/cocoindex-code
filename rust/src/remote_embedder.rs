@@ -12,6 +12,8 @@
 //!   the voyage-egress Worker (`https://…/v1`) for the pinned-IP key pool.
 //! - bearer: `CCC_EMBED_API_KEY_FILE` (path), else `CCC_EMBED_API_KEY`, else
 //!   `VOYAGE_API_KEY`. The key is never included in errors or logs.
+//! - `CCC_EMBED_CACHE=off` disables the vector cache (`embed_cache.rs`), which
+//!   otherwise lives in `~/.cccrust/embed_cache.db`.
 //! - `CCC_EMBED_MAX_INFLIGHT` — cap on concurrent HTTP requests (default 16).
 //!   The indexer fans out one call per file with no limit of its own, so
 //!   this is the only thing standing between a big corpus and a request storm.
@@ -24,6 +26,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{OnceCell, Semaphore};
 
+use crate::embed_cache::EmbedCache;
+use crate::single_flight::SingleFlight;
 use crate::embedder_params::Params;
 
 const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1";
@@ -42,6 +46,8 @@ pub struct RemoteEmbedder {
     dimension: Arc<OnceCell<usize>>,
     /// Shared by every clone, so the cap holds across all concurrent files.
     inflight: Arc<Semaphore>,
+    cache: Option<EmbedCache>,
+    flight: SingleFlight,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +80,7 @@ fn resolve_api_key() -> Result<Option<String>> {
 }
 
 impl RemoteEmbedder {
+    #[cfg(test)]
     pub fn new(model: &str, base_url: &str, api_key: Option<String>) -> Result<Self> {
         Self::with_max_inflight(model, base_url, api_key, DEFAULT_MAX_INFLIGHT)
     }
@@ -98,10 +105,27 @@ impl RemoteEmbedder {
             api_key,
             dimension: Arc::new(OnceCell::new()),
             inflight: Arc::new(Semaphore::new(max_inflight)),
+            cache: None,
+            flight: SingleFlight::default(),
         })
     }
 
-    /// Build from the environment (see module docs).
+    pub fn with_cache(mut self, cache: Option<EmbedCache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Build from the environment (see module docs), cache included.
+    pub async fn from_env_cached(model: &str) -> Result<Self> {
+        let e = Self::from_env(model)?;
+        if env_nonempty("CCC_EMBED_CACHE").as_deref() == Some("off") {
+            return Ok(e);
+        }
+        let path = crate::settings::user_settings_dir().join("embed_cache.db");
+        Ok(e.with_cache(Some(EmbedCache::open(&path).await?)))
+    }
+
+    /// Build from the environment (see module docs), no cache.
     pub fn from_env(model: &str) -> Result<Self> {
         let base = env_nonempty("CCC_EMBED_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
         let cap = match env_nonempty("CCC_EMBED_MAX_INFLIGHT") {
@@ -125,7 +149,17 @@ impl RemoteEmbedder {
         body
     }
 
+    /// Embed `texts`. With a cache: hits are free; misses are de-duplicated
+    /// (within the batch and across concurrent callers) and written through.
     pub async fn embed_batch(&self, texts: Vec<String>, params: &Params) -> Result<Vec<Vec<f32>>> {
+        match &self.cache {
+            Some(cache) => crate::cached_embed::embed_cached(self, cache, &self.flight, texts, params).await,
+            None => self.fetch(texts, params).await,
+        }
+    }
+
+    /// One HTTP request, no cache.
+    pub(crate) async fn fetch(&self, texts: Vec<String>, params: &Params) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -190,3 +224,7 @@ mod tests;
 #[cfg(test)]
 #[path = "remote_embedder_cap_tests.rs"]
 mod cap_tests;
+
+#[cfg(test)]
+#[path = "embed_cache_tests.rs"]
+mod cache_tests;
