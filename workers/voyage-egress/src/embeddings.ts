@@ -5,12 +5,13 @@
 // a request (and later requests on the same isolate) away from it.
 import type { Env } from './slot';
 import type { SlotHome } from './placement';
-import { dispatch, NoHealthySlot, SlotScheduler, UpstreamError } from './dispatch';
+import { dispatch, NoHealthySlot, UpstreamError } from './dispatch.ts';
+// Scheduler + cooldown map live in pool.ts, module-scoped and shared with
+// rerank.ts: at most POOL_PER_SLOT calls per Voyage key across both routes,
+// and a cooldown learned on either route benches the slot for both.
+import { sharedPool } from './pool.ts';
 
-const cooldownUntil = new Map<number, number>();
-// Module scope: shared by every request this isolate serves, so concurrent
-// single-batch requests spread over all slots (at most 2 calls per key).
-const scheduler = new SlotScheduler(2);
+const { scheduler, cooldownUntil } = sharedPool();
 
 // Voyage ids are bare ("voyage-4-large"); the engine's ApiEmbedder and the
 // Python ccc config use a litellm-style "voyage/" prefix. Accept both.

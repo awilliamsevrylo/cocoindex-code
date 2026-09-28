@@ -4,7 +4,8 @@
 // import it without the cloudflare:workers runtime.
 import type { Env } from './slot';
 import type { SlotHome } from './placement';
-import { NoHealthySlot, SlotScheduler } from './scheduler.ts';
+import { NoHealthySlot } from './scheduler.ts';
+import { sharedPool } from './pool.ts';
 
 // Exactly two upstream paths. Default keeps embeddings byte-identical.
 export const ALLOWED_UPSTREAM_PATHS = ['/v1/embeddings', '/v1/rerank'] as const;
@@ -14,8 +15,7 @@ export function resolveUpstreamPath(path?: string): string | null {
   return (ALLOWED_UPSTREAM_PATHS as readonly string[]).includes(p) ? p : null;
 }
 
-const cooldownUntil = new Map<number, number>();
-const scheduler = new SlotScheduler(2);
+const { scheduler, cooldownUntil } = sharedPool();
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
