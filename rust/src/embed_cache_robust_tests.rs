@@ -92,6 +92,41 @@ async fn a_malformed_blob_is_a_miss_not_a_truncated_hit() {
     );
 }
 
+/// A cache written before the shape column existed must keep hitting. The
+/// `d = 0` default means "unknown", not "zero dimensions" — treating it as a
+/// mismatch would silently throw away a live 1.8 GB cache on upgrade.
+#[tokio::test]
+async fn a_legacy_cache_row_still_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("c.db");
+
+    // The v1 schema, exactly: two columns, no `d`.
+    let old = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", db.display()))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE vectors (k BLOB PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID")
+        .execute(&old)
+        .await
+        .unwrap();
+    let k = [42u8; 32];
+    sqlx::query("INSERT INTO vectors (k, v) VALUES (?, ?)")
+        .bind(&k[..])
+        .bind(1.5f32.to_le_bytes().to_vec())
+        .execute(&old)
+        .await
+        .unwrap();
+    old.close().await;
+
+    // Opening migrates it in place; the old row is still readable.
+    let cache = EmbedCache::open(&db).await.unwrap();
+    let got = cache.get_many(&[k]).await.unwrap();
+    assert_eq!(
+        got[0],
+        Some(vec![1.5f32]),
+        "a pre-shape-column row must still be a hit"
+    );
+}
+
 /// End to end: an unusable cache still returns embeddings for the batch. This
 /// is the call site the corruption used to kill (`embed_batch` → index abort).
 #[tokio::test]
