@@ -92,6 +92,53 @@ async fn a_malformed_blob_is_a_miss_not_a_truncated_hit() {
     );
 }
 
+/// A vector containing NaN or Inf is not a usable embedding: cosine similarity
+/// against it is NaN, which poisons ranking downstream. It must be a MISS.
+#[tokio::test]
+async fn a_non_finite_blob_is_a_miss_not_a_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("c.db");
+    let cache = EmbedCache::open(&db).await.unwrap();
+
+    let good = [5u8; 32];
+    let nan = [6u8; 32];
+    let inf = [7u8; 32];
+    let mixed = [8u8; 32];
+    cache
+        .put_many(&[
+            (good, &[1.5f32, 2.5][..]),
+            (nan, &[3.0f32, 3.0][..]),
+            (inf, &[4.0f32, 4.0][..]),
+            (mixed, &[5.0f32, 5.0][..]),
+        ])
+        .await
+        .unwrap();
+
+    // Corrupt the blobs in place: same 2-dim length (so the shape guard passes),
+    // but a component that is NaN or ±Inf.
+    let raw = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rw", db.display()))
+        .await
+        .unwrap();
+    let nan_bytes = [f32::NAN.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let inf_bytes = [f32::INFINITY.to_le_bytes(), 2.0f32.to_le_bytes()].concat();
+    let neg_inf_bytes = [(-f32::INFINITY).to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    for (k, bytes) in [(&nan, &nan_bytes[..]), (&inf, &inf_bytes[..]), (&mixed, &neg_inf_bytes[..])] {
+        sqlx::query("UPDATE vectors SET v = ? WHERE k = ?")
+            .bind(bytes)
+            .bind(&k[..])
+            .execute(&raw)
+            .await
+            .unwrap();
+    }
+    drop(raw);
+
+    let got = cache.get_many(&[good, nan, inf, mixed]).await.unwrap();
+    assert_eq!(got[0], Some(vec![1.5, 2.5]), "the finite row still hits");
+    assert!(got[1].is_none(), "a NaN component must be a miss, not a hit");
+    assert!(got[2].is_none(), "an +Inf component must be a miss, not a hit");
+    assert!(got[3].is_none(), "a -Inf component must be a miss, not a hit");
+}
+
 /// A cache written before the shape column existed must keep hitting. The
 /// `d = 0` default means "unknown", not "zero dimensions" — treating it as a
 /// mismatch would silently throw away a live 1.8 GB cache on upgrade.

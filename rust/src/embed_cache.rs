@@ -67,7 +67,10 @@ fn encode(v: &[f32]) -> Vec<u8> {
 
 /// `None` when the blob is not a vector of `recorded` dims (`recorded == 0` =
 /// unknown shape, i.e. a row written before the cache recorded dimensions).
-/// A short blob must not silently become a hit of the wrong length.
+/// A short blob must not silently become a hit of the wrong length. A NaN or
+/// ±Inf component is also a miss: cosine similarity over such a vector is
+/// NaN, which poisons ranking, and no correct Voyage response ever contains
+/// one — a non-finite row means the blob was corrupted, not embedded.
 fn decode(b: &[u8], recorded: i64) -> Option<Vec<f32>> {
     if b.is_empty() || b.len() % 4 != 0 {
         return None;
@@ -76,11 +79,11 @@ fn decode(b: &[u8], recorded: i64) -> Option<Vec<f32>> {
     if recorded > 0 && recorded as usize != dims {
         return None;
     }
-    Some(
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    let v: Vec<f32> = b
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    v.iter().all(|x| x.is_finite()).then_some(v)
 }
 
 /// A cache handle. `None` inside means the cache is unusable and the handle is
