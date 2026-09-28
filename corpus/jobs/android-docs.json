@@ -1,0 +1,13 @@
+{
+  "name": "android-docs",
+  "lanes": 5,
+  "image": "mcr.microsoft.com/playwright:v1.55.0-noble",
+  "items": "android-docs-urls.txt",
+  "setup": { "file": "android-docs-setup.sh" },
+  "worker": "cd /tmp/home/ccc/corpus/crawler && node crawl.mjs \"$ITEMS_FILE\" \"$OUT_DIR\" --conc \"$CONC\" --batch \"$BATCH\"",
+  "sync": "rclone --config \"$HOME/rclone.conf\" copy \"$OUT_DIR\" \"wasabimb:drew-aosp-docs-20260928/android-docs-pw/$LANE/\" --transfers 16 --checkers 16",
+  "syncEverySec": 300,
+  "collect": "rclone --config \"$HOME/.drew/rclone-wasabimb.conf\" copy wasabimb:drew-aosp-docs-20260928/android-docs-pw \"$HOME/PROJECTS/aosp-docs/android-docs-pw\" --exclude MANIFEST.tsv --transfers 32 --checkers 32",
+  "env": { "CONC": "8", "BATCH": "64" },
+  "uploads": { "rclone.conf": "~/.drew/rclone-wasabimb.conf" }
+}
