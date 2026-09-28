@@ -4,6 +4,7 @@
 import type { Env } from './slot';
 import { assignDistinct, baseName, PLACEMENT_DO, type SlotHome } from './placement';
 import { handleEmbeddings } from './embeddings';
+import { handleRerank } from './rerank';
 
 export { baseName as slotName };
 
@@ -64,6 +65,10 @@ export default {
     if (req.method === 'POST' && (url.pathname === '/v1/embeddings' || url.pathname === '/v1/embeddings/query')) {
       const forceType = url.pathname.endsWith('/query') ? 'query' : null;
       return handleEmbeddings(req, env, await loadHomes(env), forceType);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/rerank') {
+      return handleRerank(req, env, await loadHomes(env));
     }
 
     if (url.pathname === '/probe') {

@@ -4,6 +4,7 @@
 // through its slot; nothing here ever returns or logs the key itself.
 import { DurableObject } from 'cloudflare:workers';
 import { rawRequest } from './rawhttp';
+import { resolveUpstreamPath } from './rerank';
 
 // Secrets live on the script that reads them: VOYAGE_KEYS on voyage-slot
 // (read inside the DO), WORKER_TOKEN on voyage-egress (read by the router).
@@ -68,6 +69,39 @@ export class VoyageSlot extends DurableObject<SlotEnv> {
     return new TextDecoder().decode(res.body).trim();
   }
 
+  // Caller-chosen upstream path, restricted to the allowlist in rerank.ts
+  // (/v1/embeddings and /v1/rerank only). Default stays /v1/embeddings so the
+  // embeddings request is byte-identical to before. Relays status + body.
+  async forward(
+    slot: number,
+    path: string | undefined,
+    body: string,
+  ): Promise<{ status: number; body: string; retry_after_ms?: number }> {
+    const resolved = resolveUpstreamPath(path);
+    if (!resolved) {
+      return { status: 400, body: JSON.stringify({ error: `path not allowed: ${path}` }) };
+    }
+    const key = keyForSlot(this.env.VOYAGE_KEYS, slot);
+    if (!key) return { status: 500, body: JSON.stringify({ error: `no key for slot ${slot}` }) };
+    const res = await rawRequest({
+      host: VOYAGE_HOST,
+      port: 443,
+      tls: true,
+      method: 'POST',
+      path: resolved,
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body,
+      timeoutMs: 120_000,
+    });
+    const text = new TextDecoder().decode(res.body);
+    const ra = Number(res.headers.get('retry-after'));
+    return {
+      status: res.status,
+      body: text,
+      retry_after_ms: Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined,
+    };
+  }
+
   async embed(
     slot: number,
     input: string[],
@@ -83,7 +117,7 @@ export class VoyageSlot extends DurableObject<SlotEnv> {
       port: 443,
       tls: true,
       method: 'POST',
-      path: '/v1/embeddings',
+      path: resolveUpstreamPath(undefined) ?? '/v1/embeddings',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       timeoutMs: 120_000,
