@@ -1212,3 +1212,121 @@ implementation or the pass authority.
 **Gate:** POC 11d criteria are committed here before any POC 11d product code
 starts. POC 11c may report its three existing arms without waiting for 11d;
 the dual+rerank arm is 11d's own eval step.
+
+---
+
+## POC 12 — cloud-first Vectorize index + pipeline (criteria before code)
+
+**PIVOT NOTE (Andrew, 2026-09-28 16:2xZ):** "Hard pivot, let's just make it a
+cloud first, vectorize index, and pipe." Decisions:
+
+- The pipeline runs in Workers — the corpus is already in Wasabi, so:
+  list → chunk → embed via voyage-egress → upsert to Vectorize. No Mac in
+  the loop.
+- Stop all local indexing. Done: the daemon was stopped after it reached
+  ~17 GB RSS with swap 7.66/9.2 GB used, and died at 16:18Z with 68,599 of
+  ~91,115 files indexed.
+- Two Vectorize indexes, one per model.
+
+The local embed cache (`~/.cccrust/embed_cache.db`, 1,328,731 vectors) and
+the local `target_sqlite.db` (544,118 voyage-4 chunks) are kept as an
+**optional seed, not a dependency**.
+
+**Grounded limits** (`cloudflare-docs`
+`src/content/docs/vectorize/platform/limits.mdx:19-36`; topK changelog
+2026-03-16): vector ID ≤ 64 bytes; metadata ≤ 10 KiB per vector; ≤ 20,000,000
+vectors per index; upsert ≤ 1,000 per batch from Workers (5,000 via HTTP
+API); topK ≤ 50 with metadata/values, ≤ 100 without; ≤ 10 metadata indexes,
+64 bytes indexed per field; 1,536 max dims (we use 1,024).
+
+**Core design** — all under `workers/cloud-index/`, a reusable, configurable
+Worker. Nothing is a one-off script:
+
+- **Config via wrangler vars/bindings:** SOURCE bucket + prefix (Wasabi, via
+  the SigV4 shim copied from `~/PROJECTS/ccc-ai-search/worker/src/wasabi.ts`),
+  `INDEX_PRIMARY` (voyage-4) and `INDEX_SECONDARY` (voyage-code-4) Vectorize
+  bindings, chunk size 1000 / overlap 150 / min 250 (the Rust engine's
+  values).
+- **Chunk identity:**
+  `id = sha256hex(path + "\n" + start_line + "\n" + end_line + "\n" + sha256(content))`
+  — 64 hex chars, the **same id in both indexes** so fusion joins on id.
+  Metadata: `path`, `start_line`, `end_line`, `lang`, `text` (≤ 8 KiB,
+  truncated with a flag), `corpus`.
+- **Embedding goes through voyage-egress over a SERVICE BINDING with an RPC
+  method** (owner rule: RPC-first between Workers, no fake URLs), so it gets
+  the same 13 keys / 13 IPs, the shared scheduler, 429 cooldowns and
+  batching.
+- **Orchestration is durable:** a Cloudflare Workflow (or thin coordinator
+  DO) walks the Wasabi listing in shards and persists a cursor; each step is
+  fetch → chunk → embed both models → upsert both indexes. Idempotent: upsert
+  by id; skip ids already present (`getByIds`) before spending tokens.
+- **Search is a core route** `POST /v1/search {query, k, mode:
+  primary|secondary|dual, rerank: bool}`: embed the query with each model
+  (`input_type` query), query each index topK 50, fuse by rank-only RRF
+  (k=60, weights 1/1 — the same algorithm as `rust/src/fusion.rs`,
+  commit 4a5157e), rerank the top 50 via voyage-egress `/v1/rerank`, and
+  fall back to fused order with `rerank_status` reported.
+  `cccrust search --cloud` calls this route.
+
+### POC 12.0 — two Vectorize indexes
+
+Two Vectorize indexes exist (1024 dims, cosine), with metadata indexes on
+`path` and `corpus`, created via API; the index names and their
+`wrangler vectorize info` output are recorded here.
+
+- [ ] **PASS:** both indexes report dimensions 1024 and metric cosine.
+
+### POC 12.1 — voyage-egress RPC embed entrypoint
+
+voyage-egress exposes an RPC entrypoint
+`embed(texts, model, inputType) -> number[][]` over a service binding.
+
+- [ ] **PASS:** a caller Worker gets 1024-dim vectors for both voyage-4 and
+  voyage-code-4 via RPC; the HTTP `/v1/embeddings` route stays byte-identical
+  (the existing live suites stay green); input order is preserved for 300
+  inputs.
+
+### POC 12.2 — cloud-index reads Wasabi and chunks
+
+- [ ] **PASS:** for 3 named corpus files, it lists and fetches them through
+  the SigV4 shim; chunk count and boundaries are deterministic across 2 runs;
+  each chunk is ≤ 1000 chars plus overlap; the ids are 64 hex chars; a unit
+  test covers the splitter's edge cases (empty file, one huge line, CRLF, a
+  UTF-8 multibyte boundary).
+
+### POC 12.3 — one file end to end
+
+- [ ] **PASS:** all its chunks are in BOTH indexes under the same ids with
+  correct metadata; a re-run spends 0 embedding tokens (skip-existing proven
+  by the voyage-egress usage counter); a changed file replaces only its
+  changed chunk ids and deletes stale ones.
+
+### POC 12.4 — durable fan-out on a 1,000-file slice
+
+- [ ] **PASS:** the Workflow completes; the vector count equals the chunk
+  count in both indexes; killing or redeploying mid-run resumes from the
+  cursor with no duplicate spend; throughput (chunks/s) and Voyage tokens
+  are recorded.
+
+### POC 12.5 — search
+
+- [ ] **PASS:** `/v1/search` in modes primary, secondary and dual, each with
+  and without rerank, returns results with provenance (per-index rank and
+  similarity); `rerank_status` distinguishes Reranked from Fallback; the POC
+  9 known-answer queries hit top 5 in dual mode; `cccrust search --cloud`
+  prints the same results.
+
+### POC 12.6 — full corpus plus eval
+
+- [ ] **PASS:** all Wasabi corpus files are indexed in both indexes (counts
+  recorded against the file listing); the 106-query eval runs on the SAME
+  frozen snapshot in arms primary, secondary, dual, primary+rerank and
+  dual+rerank, with explicit `--no-rerank` on the non-rerank arms; hit@1,
+  hit@5 and added latency are reported per arm against the baseline (35/106
+  hit@1, 59/106 hit@5, error strings 3/12). The minimum useful improvement
+  is declared before running: **+5 hit@1 for dual+rerank vs primary**.
+
+**Superseded by POC 12:** the local secondary-index backfill (POC 11a local)
+and the local full-index completion (task-623's local path). **Keep:**
+`fusion.rs`, `rerank.rs` and `dual_search.rs` as the Rust reference
+implementations.
