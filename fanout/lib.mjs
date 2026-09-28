@@ -6,67 +6,13 @@
 // is idempotent, so the transport may retry any call.
 import { readFileSync, readdirSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { join, resolve } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
-import { gzipSync, gunzipSync } from 'node:zlib';
+import { gunzipSync } from 'node:zlib';
+import { shq, run, upload, download, tarFiles, gcloudTransport, localTransport, CHUNK_B64 } from './transfer.mjs';
+export { shq, run, upload, download, tarFiles, gcloudTransport, localTransport, CHUNK_B64 } from './transfer.mjs';
 
 export const MIN_LANES = 5;
-export const CHUNK_B64 = 48 * 1024; // base64 chars per upload call
-const RAW_SLICE = 36 * 1024; // raw bytes per download call (= 48 KB base64)
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const sha256 = (b) => createHash('sha256').update(b).digest('hex');
-export const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-
-// ── transports: exec(lane, command, timeoutMs) -> combined output text ──
-export function gcloudTransport(credPath = join(homedir(), '.local/state/gcloud-ssh-mcp.json')) {
-  const cred = JSON.parse(readFileSync(credPath, 'utf8')); // never printed
-  return async function exec(lane, command, timeoutMs = 300000) {
-    let last;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const res = await fetch(cred.url, {
-          method: 'POST',
-          // A hung lane must fail here, not hold the caller forever: undici's
-          // defaults stretch one stuck call to ~300 s, and the retry loop would
-          // then pay that four times. Client-side ceiling = server budget + 30 s.
-          signal: AbortSignal.timeout(Math.min(timeoutMs, 300000) + 30000),
-          headers: { ...cred.headers, 'Content-Type': 'application/json', 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': 'tools/call', 'Mcp-Name': 'shell_exec' },
-          body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call',
-            params: { name: 'shell_exec', arguments: { command, singleton: lane.singleton, image: lane.image, timeoutMs: Math.min(timeoutMs, 300000) } } }),
-        });
-        const text = await res.text();
-        let j; try { j = JSON.parse(text); } catch { throw new Error(`HTTP ${res.status} from gcloud-ssh-mcp`); }
-        if (j.error) throw new Error(`rpc ${j.error.code}: ${String(j.error.message).slice(0, 200)}`);
-        return (j.result?.content || []).map((c) => c.text).join('\n');
-      } catch (e) {
-        last = e;
-        // A client abort is a dead/hung lane, not a transient transport blip:
-        // each retry would pay the full timeout again. One refusal is the verdict.
-        if (e.name === 'TimeoutError' || e.name === 'AbortError') break;
-        await sleep(2000 * 2 ** attempt);
-      }
-    }
-    throw new Error(`lane ${lane.singleton}: transport failed: ${last.message}`);
-  };
-}
-
-// Runs commands with local bash — the test seam, and a way to dry-run a spec.
-export function localTransport() {
-  return async (_lane, command) => {
-    const r = spawnSync('bash', ['-c', command], { encoding: 'utf8', maxBuffer: 1 << 28 });
-    return (r.stdout || '') + (r.stderr || '');
-  };
-}
-
-// Wraps a command in markers so banners / trailers the transport adds are
-// ignored, and returns {rc, text}. Commands must not call `exit`.
-export async function run(exec, lane, cmd, timeoutMs = 120000) {
-  const out = await exec(lane, `echo __FX_BEGIN__\n{\n${cmd}\n} 2>&1\necho "__FX_RC__ $?"\n`, timeoutMs);
-  const b = out.indexOf('__FX_BEGIN__\n'), m = out.lastIndexOf('__FX_RC__ ');
-  if (b < 0 || m < b) throw new Error(`lane ${lane.singleton}: no result markers: ${out.slice(-300)}`);
-  return { rc: parseInt(out.slice(m + 10), 10), text: out.slice(b + 13, m).replace(/\n$/, '') };
-}
 
 // ── items + sharding ──
 export const hash32 = (s) => createHash('sha1').update(s).digest().readUInt32BE(0);
@@ -109,81 +55,6 @@ export function loadItems(src) {
   return { dir, items };
 }
 export const remainder = (items, ok) => items.filter((i) => !ok.has(i));
-
-// ── byte transfer in ≤48 KB calls (idempotent parts, sha256-verified) ──
-// Eight digits, not five: `cat pre.*` orders by name, so a five-digit index
-// misorders the moment an upload passes 99,999 parts (a >4.8 GB base64 body).
-const partName = (i) => String(i).padStart(8, '0');
-// Every upload owns a private part namespace (`<path>.fxpart.<nonce>.NNNNNNNN`)
-// and stages into `<path>.fxtmp.<nonce>`. Two uploads of one path therefore
-// never share a file: each either verifies its own bytes and atomically renames
-// them into place (last writer wins), or fails without touching the target.
-// The transport is at-least-once, so a repeated finalize must be a no-op that
-// leaves a verified file alone rather than re-deriving it from deleted parts.
-export async function upload(exec, lane, path, buf, { gzip = false } = {}) {
-  const want = sha256(buf);
-  const b64 = (gzip ? gzipSync(buf) : Buffer.from(buf)).toString('base64');
-  const parts = Math.max(1, Math.ceil(b64.length / CHUNK_B64));
-  const nonce = randomBytes(8).toString('hex');
-  const pre = `${path}.fxpart.${nonce}`;
-  const tmp = `${path}.fxtmp.${nonce}`;
-  // Note the space after `$(`: `$((` is bash ARITHMETIC expansion, so the
-  // command form must never start a `$(`-group with a parenthesised command.
-  const sum = ` (sha256sum ${shq(tmp)} 2>/dev/null || shasum -a 256 ${shq(tmp)}) | cut -c1-64`;
-  // `-e` not `-s`: a zero-byte payload still has one (empty) part file, and an
-  // empty-but-present part is data, not absence.
-  const have = Array.from({ length: parts }, (_, i) => `[ -e ${shq(`${pre}.${partName(i)}`)} ]`).join(' && ');
-  const decode = `  if ${have} && cat ${shq(pre)}.* | base64 -d ${gzip ? '| gunzip -c ' : ''}> ${shq(tmp)}` +
-    ` && [ "$(${sum})" = '${want}' ] && mv -f ${shq(tmp)} ${shq(path)}; then`;
-  const finalize = [
-    `if [ ! -e ${shq(path)} ]; then`, // fast path: nothing there yet
-    decode,
-    `    rm -f ${shq(pre)}.* ${shq(tmp)}; echo done`,
-    '  else',
-    `    rm -f ${shq(tmp)}; echo notok`,
-    '  fi',
-    `elif [ "$(${sum.replace(shq(tmp), shq(path))})" = '${want}' ]; then`, // already committed
-    '  echo uptodate',
-    'else',
-    decode,
-    `    rm -f ${shq(pre)}.* ${shq(tmp)}; echo done`,
-    '  else',
-    `    rm -f ${shq(tmp)}; echo notok`,
-    '  fi',
-    'fi',
-  ].join('\n');
-  for (let i = 0; i < parts; i++) {
-    const piece = b64.slice(i * CHUNK_B64, (i + 1) * CHUNK_B64);
-    const r = await run(exec, lane, `mkdir -p ${shq(dirname(path))} && printf '%s' '${piece}' > ${shq(`${pre}.${partName(i)}`)}`);
-    if (r.rc) throw new Error(`upload ${path} part ${i} on ${lane.singleton}: ${r.text}`);
-  }
-  const r = await run(exec, lane, finalize);
-  if (r.rc || !/^(done|uptodate)$/.test(r.text.trim())) throw new Error(`upload ${path} on ${lane.singleton}: checksum mismatch (${r.text.slice(0, 120)})`);
-  return { bytes: buf.length, calls: parts + 1 };
-}
-export async function download(exec, lane, path) {
-  // Snapshot first: the live file may be appended to (MANIFEST.tsv) between the
-  // size probe and the slices, which would trip the length check spuriously.
-  const snap = `${path}.fxsnp.${randomBytes(8).toString('hex')}`;
-  const s = await run(exec, lane, `if [ -f ${shq(path)} ]; then cp ${shq(path)} ${shq(snap)} && wc -c < ${shq(snap)}; else echo -1; fi`);
-  const size = parseInt(s.text.trim(), 10);
-  if (!(size >= 0)) return null;
-  const bufs = [];
-  for (let off = 0; off < size; off += RAW_SLICE) {
-    const r = await run(exec, lane, `tail -c +${off + 1} ${shq(snap)} | head -c ${RAW_SLICE} | base64 | tr -d '\\n'`);
-    bufs.push(Buffer.from(r.text.trim(), 'base64'));
-  }
-  await run(exec, lane, `rm -f ${shq(snap)}`);
-  const buf = Buffer.concat(bufs);
-  if (buf.length !== size) throw new Error(`download ${path} on ${lane.singleton}: got ${buf.length} of ${size} bytes`);
-  return buf;
-}
-export function tarFiles(dir, files) {
-  const r = spawnSync('tar', ['czf', '-', '--no-xattrs', '-C', dir, '-T', '-'],
-    { input: files.join('\n') + '\n', env: { ...process.env, COPYFILE_DISABLE: '1' }, maxBuffer: 1 << 30 });
-  if (r.status !== 0) throw new Error(`tar failed: ${String(r.stderr).slice(0, 300)}`);
-  return r.stdout;
-}
 
 // ── spec ──
 const script = (v, base) => (v && typeof v === 'object' && v.file ? readFileSync(resolve(base, v.file), 'utf8') : v || '');
@@ -264,7 +135,7 @@ function runScript(spec, i, root) {
   const env = { ITEMS_FILE: `${root}/items.txt`, OUT_DIR: `${root}/out`, IN_DIR: `${root}/in`,
     LANE: spec.lane[i].singleton, LANE_INDEX: String(i), FANOUT_NAME: spec.name, ...Object.fromEntries(extra) };
   return ['#!/usr/bin/env bash', ...Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}`),
-    `cd ${shq(root)}`, 'mkdir -p "$OUT_DIR" "$IN_DIR"', 'rm -f done', 'SP=',
+    `cd ${shq(root)}`, 'mkdir -p "$OUT_DIR" "$IN_DIR"', 'SP=',
     `if [ -s sync.sh ]; then ( while sleep ${Number(spec.syncEverySec)}; do bash sync.sh >> sync.log 2>&1; done ) & SP=$!; fi`,
     'echo "[fanout] start $(date -u +%FT%TZ) items=$(wc -l < "$ITEMS_FILE")"',
     'bash worker.sh; rc=$?',
@@ -284,7 +155,8 @@ export async function pushUploads(exec, spec, i) {
     const src = spec.uploads[name].replace(/^~(?=\/)/, homedir());
     const dst = `${spec.uploadHome || '/tmp/home'}/${name}`;
     await upload(exec, lane, dst, readFileSync(src));
-    await run(exec, lane, `chmod 600 ${shq(dst)}`);
+    const mode = await run(exec, lane, `chmod 600 ${shq(dst)}`);
+    if (mode.rc) throw new Error(`upload ${dst} on ${lane.singleton}: chmod 600 failed (${mode.text.slice(0, 120)})`);
   }
   return names.length;
 }
@@ -343,7 +215,7 @@ export async function startLane(exec, spec, i, items, { dir = null, attempts = 0
   // M3: is the lane's OWN worker running? `spec.lane[i].startToken` is the token
   // the previous launch used (the CLI persists it); unset, the check falls back
   // to pid + cmdline.
-  const live = await run(exec, lane, `${ALIVE}; ${aliveCheck(spec, i)} && echo alive || echo idle`);
+  const live = await run(exec, lane, `${idSh(spec, i, false)}\n${ALIVE}; ${aliveCheck(spec, i)} && echo alive || echo idle`);
   if (live.text.trim().endsWith('alive')) return { ...base, launched: false, reason: 'alive' };
   const setup = await ensureSetup(exec, spec, i);
   if (/^UNKNOWN/.test(setup)) return { ...base, launched: false, reason: 'UNKNOWN lane' };
@@ -375,7 +247,7 @@ export async function startLane(exec, spec, i, items, { dir = null, attempts = 0
   // "started" — and the worker's own $OUT_DIR/$IN_DIR ride the symlinks into
   // $core, so the results still land on THIS container's private tree.
   const launch = `cd "$root" && rm -f "$core/pid" "$core/pid.token"\nS=; command -v setsid >/dev/null && S=setsid; $S nohup bash run.sh </dev/null >> "$core/run.log" 2>&1 & echo $! > "$core/pid"; printf '%s\\n' ${shq(tok)} > "$core/pid.token"; echo "started $!"`;
-  const r = await run(exec, lane, `${idSh(spec, i, false)}\n[ "$id" = UNKNOWN ]&&{ echo "UNKNOWN: refusing to launch on a lane that is not ours"; } || {\nmkdir -p "$core/out" "$core/in"; ln -sfn "$core/out" "$root/out" 2>/dev/null; ln -sfn "$core/in" "$root/in" 2>/dev/null; rm -f "$core/done"\n${launch}\n}`.trimEnd());
+  const r = await run(exec, lane, `${idSh(spec, i, false)}\n[ "$id" = UNKNOWN ]&&{ echo "UNKNOWN: refusing to launch on a lane that is not ours"; } || {\nmkdir -p "$core/out" "$core/in"; ln -sfn "$core/out" "$root/out" 2>/dev/null; ln -sfn "$core/in" "$root/in" 2>/dev/null; rm -f "$core/done" "$root/done"; ln -s "$core/done" "$root/done"\n${launch}\n}`.trimEnd());
   return { ...out, launched: r.text.includes('started'), reason: r.text.trim().split('\n').slice(-1)[0] };
 }
 // One status line per lane: identity, alive, done rc, unique ok, ok lines,

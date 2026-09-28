@@ -85,7 +85,9 @@ function mockExec(manifest) {
   const exec = async (_lane, command) => {
     const wrap = (s, rc = 0) => `banner\n__FX_BEGIN__\n${s}\n__FX_RC__ ${rc}\n`;
     const gz = (await import('node:zlib')).gzipSync(Buffer.from(manifest.filter((r) => r[1] === 'ok').map((r) => r[0]).join('\n') + '\n'));
-    if (command.includes('echo alive; else echo idle')) return wrap('idle');
+    if (command.includes('&& echo alive || echo idle')) return wrap('idle');
+    if (command.includes('echo "$id $(id -un)')) return wrap('OURS test 0');
+    if (command.includes('echo "$core/ok.gz"')) return wrap('/tmp/mock-ok.gz');
     if (command.includes('wc -c <')) return wrap(String(gz.length));
     if (command.includes('tail -c +')) return wrap(gz.toString('base64'));
     // Upload parts are namespaced by a per-upload nonce: `<path>.fxpart.<nonce>.<seq>`.

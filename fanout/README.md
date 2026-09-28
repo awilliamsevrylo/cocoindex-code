@@ -11,6 +11,7 @@ node fanout/cli.mjs status  spec.json [--heal]   # per-lane table; --heal relaun
 node fanout/cli.mjs watch   spec.json --every 10m  # status --heal loop, also the keepalive
 node fanout/cli.mjs stop    spec.json [--lane 2]
 node fanout/cli.mjs collect spec.json            # runs spec.collect locally
+# add --reshard only when intentionally changing a recorded lane count
 node --test fanout/test/*.mjs                    # no gcloud needed
 ```
 
@@ -41,6 +42,14 @@ node --test fanout/test/*.mjs                    # no gcloud needed
 | `lanePrefix` / `laneNames` | lane singleton names (default `<name>-<i>`) |
 | `maxAttempts` | heal relaunches per lane before `status` gives up (5) |
 
+Changing `lanes` re-shards every item. Once local state records a lane count,
+commands refuse a different count unless `--reshard` explicitly accepts the
+redo. `--reshard` does not rename or migrate old `lane-<i>` directories.
+
+Directory item mode follows a symlink only when it resolves to a regular file
+inside the source root. Escaping, dangling, special-file, and directory
+symlinks are skipped; directory symlinks are never walked.
+
 Worker env: `ITEMS_FILE`, `OUT_DIR`, `IN_DIR`, `LANE`, `LANE_INDEX`,
 `FANOUT_NAME`, plus `spec.env`.
 
@@ -53,8 +62,14 @@ Worker env: `ITEMS_FILE`, `OUT_DIR`, `IN_DIR`, `LANE`, `LANE_INDEX`,
   whose worker is alive is never started twice.
 - **Transfers** use sha256-checked base64 parts of ≤48 KB per call, with
   idempotent part files, so the transport may retry any call.
+- **Lane identity:** the setup container owns a private token and container
+  directory. If a singleton name is answered by a container that cannot prove
+  both, its state is `UNKNOWN`. `UNKNOWN` never means dead and is never healed
+  or relaunched automatically; inspect the routing/container first.
 - **Keepalive:** a lane's VM stays awake ~30 min after the last call. `watch`
-  with `--every` ≤ 20m keeps it up and heals recycled lanes.
+  with `--every` ≤ 20m keeps it up and heals recycled lanes. `watch` exits `0`
+  only when all items complete, `1` when work is stalled/given up with items
+  unfinished, and `2` for CLI/spec usage errors.
 - **Local state** (lane map, last status, relaunch counts) lives in
   `~/.local/state/fanout/<name>/state.json`.
 

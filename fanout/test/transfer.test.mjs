@@ -3,7 +3,7 @@
 // Run: node --test fanout/test/*.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, appendFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, appendFileSync, readdirSync, statSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -55,9 +55,13 @@ test('T2: two concurrent uploads of one path both succeed with consistent bytes 
 test('T3: a part set split across hosts fails closed and never truncates the target [fix: part guard + tmp staging]', async () => {
   const local = fx.localTransport();
   const root = tmp(), hosts = [tmp(), tmp()];
-  let n = 0;
-  // Deterministic routing: part 0 lands on host A, everything after on host B.
-  const exec = async (l, cmd, t) => local(l, cmd.split(root).join(hosts[n++ === 0 ? 0 : 1]), t);
+  let partCalls = 0;
+  // Deterministic routing: part 0 lands on host A, everything else on host B.
+  const exec = async (l, cmd, t) => {
+    const isPart = cmd.includes("printf '%s'") && cmd.includes('.fxpart.');
+    const host = isPart && partCalls++ === 0 ? hosts[0] : hosts[1];
+    return local(l, cmd.split(root).join(host), t);
+  };
   const p = join(root, 'items.txt');
   const sentinel = Buffer.from('PRIOR CONTENT MUST SURVIVE\n');
   writeFileSync(join(hosts[1], 'items.txt'), sentinel); // where the finalize call lands
@@ -70,7 +74,88 @@ test('T3: a part set split across hosts fails closed and never truncates the tar
   assert.deepEqual(leftovers(hosts[1]).filter((n) => n.includes('.fxtmp.')), [], 'no staging file left behind');
 });
 
-test('T4: a hung transport call rejects on a client-side deadline [fix: AbortSignal.timeout(timeoutMs + 30s)]', async () => {
+test('T4: upload bytes are 0600 from first part through atomic target', async () => {
+  const local = fx.localTransport();
+  const d = tmp(), seen = [];
+  const exec = async (l, cmd, t) => {
+    const out = await local(l, cmd, t);
+    for (const name of readdirSync(d)) {
+      if (/\.fxpart\.|\.fxtmp\.|^secret\.conf$/.test(name)) seen.push([name, statSync(join(d, name)).mode & 0o777]);
+    }
+    return out;
+  };
+  await fx.upload(exec, lane, join(d, 'secret.conf'), Buffer.from('secret-value\n'.repeat(8000)));
+  assert.ok(seen.length > 1, 'sampled transfer files during multiple calls');
+  assert.deepEqual([...new Set(seen.map(([, mode]) => mode))], [0o600], `world-readable sample: ${JSON.stringify(seen)}`);
+});
+
+test('T5: checksum failure removes this upload parts and staging file', async () => {
+  const local = fx.localTransport();
+  const d = tmp(), p = join(d, 'secret.conf');
+  const corrupt = async (l, cmd, t) => local(l, cmd.includes('base64 -d')
+    ? cmd.replaceAll('base64 -d ', 'base64 -d | { cat; printf x; } ')
+    : cmd, t);
+  await assert.rejects(fx.upload(corrupt, lane, p, Buffer.from('top-secret\n')), /checksum mismatch/);
+  assert.deepEqual(leftovers(d), [], 'failed upload left decodable parts or a staging file');
+});
+
+test('T6: a chmod failure is propagated by pushUploads', async () => {
+  const local = fx.localTransport();
+  const d = tmp(), src = join(tmp(), 'secret.conf');
+  writeFileSync(src, 'secret\n');
+  const deny = async (l, cmd, t) => local(l, /chmod 600/.test(cmd) ? cmd.replace(/chmod 600 [^\n]+/, 'false') : cmd, t);
+  await assert.rejects(fx.pushUploads(deny, { lane: [lane], uploads: { 'secret.conf': src }, uploadHome: d }, 0), /chmod/);
+  assert.equal(statSync(join(d, 'secret.conf')).mode & 0o777, 0o600, 'atomic upload was private even before chmod failed');
+  assert.deepEqual(leftovers(d), []);
+});
+
+test('T7: a later upload reaps stale foreign nonce parts', async () => {
+  const d = tmp(), p = join(d, 'items.txt');
+  const old = `${p}.fxpart.deadbeefdeadbeef.00000000`;
+  writeFileSync(old, Buffer.from('abandoned secret').toString('base64'));
+  const then = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  utimesSync(old, then, then);
+  await fx.upload(fx.localTransport(), lane, p, Buffer.from('fresh\n'));
+  assert.deepEqual(leftovers(d), [], 'stale foreign nonce wedged the path');
+});
+
+test('T8: shasum fallback recognizes an already committed identical upload', async () => {
+  const local = fx.localTransport();
+  const exec = (l, cmd, t) => local(l, `sha256sum(){ return 1; }\n${cmd}`, t);
+  const d = tmp(), p = join(d, 'items.txt'), body = Buffer.from('same bytes\n');
+  await fx.upload(exec, lane, p, body);
+  await fx.upload(exec, lane, p, body);
+  assert.ok(readFileSync(p).equals(body));
+  assert.deepEqual(leftovers(d), []);
+});
+
+test('T9: a thrown download slice removes its snapshot', async () => {
+  const local = fx.localTransport();
+  const d = tmp(), p = join(d, 'items.txt');
+  writeFileSync(p, Buffer.alloc(80 * 1024, 1));
+  const fail = async (l, cmd, t) => { if (cmd.includes('tail -c +')) throw new Error('transport split'); return local(l, cmd, t); };
+  await assert.rejects(fx.download(fail, lane, p), /transport split/);
+  assert.deepEqual(leftovers(d), [], 'download exception leaked its snapshot');
+});
+
+test('T9b: a lost snapshot response still removes the remote snapshot', async () => {
+  const local = fx.localTransport();
+  const d = tmp(), p = join(d, 'items.txt');
+  writeFileSync(p, Buffer.alloc(80 * 1024, 2));
+  let lost = false;
+  const fail = async (l, cmd, t) => {
+    if (!lost && cmd.includes('cp ') && cmd.includes('.fxsnp.')) {
+      lost = true;
+      await local(l, cmd, t);
+      throw new Error('snapshot response lost');
+    }
+    return local(l, cmd, t);
+  };
+  await assert.rejects(fx.download(fail, lane, p), /snapshot response lost/);
+  assert.deepEqual(leftovers(d), [], 'response loss after snapshot creation leaked bytes');
+});
+
+test('T10: a hung transport call rejects on a client-side deadline [fix: AbortSignal.timeout(timeoutMs + 30s)]', async () => {
   const srv = createServer(() => {}); // accepts, never answers
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const cred = join(tmp(), 'cred.json');
