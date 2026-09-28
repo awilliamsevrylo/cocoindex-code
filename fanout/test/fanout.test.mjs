@@ -2,7 +2,7 @@
 // lane, with the lane root under a temp dir. Run: node --test fanout/test/*.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
@@ -41,6 +41,18 @@ test('chunked uploader round-trips a 200 KB item list byte-exact', async () => {
   const back = await fx.download(exec, lane, join(d, 'a/items.txt'));
   assert.ok(back.equals(buf), 'download returns the same bytes');
   assert.equal(await fx.download(exec, lane, join(d, 'nope')), null);
+});
+
+test('spec.uploads lands byte-exact and 0600 before setup; bad names refused', async () => {
+  const exec = fx.localTransport();
+  const home = tmp(), src = join(tmp(), 'secret.conf');
+  const body = Buffer.from(`[wasabi]\nkey = ${randomBytes(24).toString('hex')}\n`);
+  writeFileSync(src, body);
+  const spec = { lane: [lane], uploads: { 'rclone.conf': src }, uploadHome: home };
+  assert.equal(await fx.pushUploads(exec, spec, 0), 1);
+  assert.ok(readFileSync(join(home, 'rclone.conf')).equals(body));
+  assert.equal(statSync(join(home, 'rclone.conf')).mode & 0o777, 0o600);
+  await assert.rejects(fx.pushUploads(exec, { ...spec, uploads: { '../x': src } }, 0), /plain file name/);
 });
 
 test('dir mode: tar shard of a directory round-trips byte-exact', async () => {

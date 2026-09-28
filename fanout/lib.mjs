@@ -155,8 +155,25 @@ function runScript(spec, i, root) {
 }
 const pidCheck = (root) => `cd ${shq(root)} 2>/dev/null && ${ALIVE} && p=$(cat pid 2>/dev/null)`;
 
+// spec.uploads: { "<name under $HOME>": "<local path, ~ ok>" } — secrets and
+// configs a lane needs (e.g. rclone.conf). Written 0600 before setup; content
+// never printed. Re-sent on every setup so a rotated credential propagates.
+export async function pushUploads(exec, spec, i) {
+  const lane = spec.lane[i];
+  const names = Object.keys(spec.uploads || {});
+  for (const name of names) {
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`uploads key must be a plain file name: ${name}`);
+    const src = spec.uploads[name].replace(/^~(?=\/)/, homedir());
+    const dst = `${spec.uploadHome || '/tmp/home'}/${name}`;
+    await upload(exec, lane, dst, readFileSync(src));
+    await run(exec, lane, `chmod 600 ${shq(dst)}`);
+  }
+  return names.length;
+}
+
 export async function ensureSetup(exec, spec, i) {
   const lane = spec.lane[i], root = laneRoot(spec, i);
+  await pushUploads(exec, spec, i);
   if (!spec.setup) return 'none';
   const tag = sha256(spec.setup).slice(0, 12);
   await upload(exec, lane, `${root}/setup.sh`, Buffer.from(spec.setup));
