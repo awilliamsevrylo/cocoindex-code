@@ -659,3 +659,50 @@ reference, compose, training, studio, kotlin):**
 - [ ] total saved ≥ 98% of 53,978; failures listed with status
 
 Then POC 9b runs on the new corpus.
+
+### POC 10a — result (2026-09-28): PASS
+
+On `pw-crawl-00`, Playwright v1.55.0 image, 24 URLs across 12 doc sections,
+compared against fresh keyless Jina fetches of the same URLs (`check-quality.mjs`):
+- [x] H1 title 24/24 · [x] chrome leaks 0 · [x] code fences on 17 pages ·
+      [x] GFM tables on 13 pages · [x] mean body word recall **0.987**
+- The first two runs scored 0.780 and then 0.891. Both misses were the
+  **instrument**, not the extractor:
+  - The recall was measured against Jina's envelope, TOC and feedback widget.
+  - Code was stripped from ours, while Jina emits it unfenced.
+  - Fixed in `4c9b40c` and `6fb96c7`; the missing-word list is printed.
+- The gate has teeth (negative controls): halving every page's body gives
+  0.597 → FAIL, and injecting "Send feedback" gives 1 leak → FAIL.
+
+### POC 10b — result (2026-09-28): PASS
+
+The first bench ran at **39.4 pages/min** at conc 4. That was a defect, not the network:
+- One long-lived page decayed from 327 to 130 pages/min over 450 URLs while
+  the renderer grew to 3.3 GB.
+- Reference pages are ~2.2 MB, almost all nav. DOMParser takes ~60 ms on the
+  full page vs 3 ms on `<head>`+`<article>` (66 KB).
+- Fix `725032a`: parse only that slice, and recycle the page every 8 batches.
+  10a re-gated after the fix: still 0.987.
+
+Disjoint 450-URL slice per arm, one instance (2 vCPU):
+
+| conc | ok | fail | min | pages/min | statuses |
+|---|---|---|---|---|---|
+| 4 | 449 | 1 | 1.38 | 324.6 | 200×449, 404×1 |
+| 8 | 450 | 0 | 0.93 | 485.8 | 200×450 |
+| 16 | 450 | 0 | 0.63 | 714.7 | 200×450 |
+| 32 | 450 | 0 | 0.59 | 760.5 | 200×450 |
+| 48 | 450 | 0 | 0.67 | 668.2 | 200×450 |
+
+- [x] failures 1/2,250 = 0.04% (a real 404); **0 × 429, 0 × 403**
+- [x] conc from the knee: best 760.5 at 32; the smallest conc within 10% is
+      **16** (714.7), so it goes in `corpus/jobs/android-docs.json`
+      (`CONC=16`, `BATCH=128`)
+- Estimate: 5 lanes × ~700 pages/min → 53,925 URLs in about 15–20 min,
+  vs about 10 h for the keyless Jina crawl.
+
+URL list: `corpus/jobs/android-docs-urls.mjs` regenerates
+`android-docs-urls.txt` from the sitemap index, **53,925** URLs, English
+only. The sitemap repeats every page for each `?hl=` locale: 64,925 of
+118,850 in-scope locations. Byte-order identical to the original 53,978
+shard list, minus 53 URLs the sitemap no longer lists.

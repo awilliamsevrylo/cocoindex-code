@@ -8,6 +8,6 @@
   "sync": "rclone --config \"$HOME/rclone.conf\" copy \"$OUT_DIR\" \"wasabimb:drew-aosp-docs-20260928/android-docs-pw/$LANE/\" --transfers 16 --checkers 16",
   "syncEverySec": 300,
   "collect": "rclone --config \"$HOME/.drew/rclone-wasabimb.conf\" copy wasabimb:drew-aosp-docs-20260928/android-docs-pw \"$HOME/PROJECTS/aosp-docs/android-docs-pw\" --exclude MANIFEST.tsv --transfers 32 --checkers 32",
-  "env": { "CONC": "8", "BATCH": "64" },
+  "env": { "CONC": "16", "BATCH": "128" },
   "uploads": { "rclone.conf": "~/.drew/rclone-wasabimb.conf" }
 }
