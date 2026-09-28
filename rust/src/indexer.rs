@@ -204,6 +204,7 @@ pub async fn run_index(
 
     let app = Environment::builder()
         .db_path(coco_db_path)
+        .lmdb_map_size(crate::lmdb_size::lmdb_map_size())
         .provide_key(&DB, db)
         .provide_key(&EMBEDDER, embedder.clone())
         .provide_key(&PROJECT_SETTINGS, Arc::new(project.clone()))

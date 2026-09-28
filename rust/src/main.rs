@@ -13,6 +13,7 @@ mod remote_embedder;
 mod retry;
 mod index_model;
 mod indexer;
+mod lmdb_size;
 mod mcp;
 mod project;
 mod protocol;
