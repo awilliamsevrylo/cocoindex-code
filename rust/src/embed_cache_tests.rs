@@ -69,18 +69,27 @@ fn p(v: &str) -> Params {
 
 async fn cached(base: &str, dir: &std::path::Path) -> RemoteEmbedder {
     let cache = EmbedCache::open(&dir.join("c.db")).await.unwrap();
-    RemoteEmbedder::new("m", base, None).unwrap().with_cache(Some(cache))
+    RemoteEmbedder::new("m", base, None)
+        .unwrap()
+        .with_cache(Some(cache))
 }
 
 #[test]
 fn key_depends_on_model_params_and_text() {
     let k = cache_key("m", &p("document"), "t");
     assert_ne!(k, cache_key("m2", &p("document"), "t"));
-    assert_ne!(k, cache_key("m", &p("query"), "t"), "document vs query vectors differ");
+    assert_ne!(
+        k,
+        cache_key("m", &p("query"), "t"),
+        "document vs query vectors differ"
+    );
     assert_ne!(k, cache_key("m", &p("document"), "t2"));
     assert_eq!(k, cache_key("m", &p("document"), "t"));
     // Length prefixing: unprefixed, both of these flatten to "v1a{}{}".
-    assert_ne!(cache_key("a{}", &Params::new(), ""), cache_key("a", &Params::new(), "{}"));
+    assert_ne!(
+        cache_key("a{}", &Params::new(), ""),
+        cache_key("a", &Params::new(), "{}")
+    );
 }
 
 #[tokio::test]
@@ -94,7 +103,11 @@ async fn second_call_is_served_from_cache() {
     // A new embedder on the same db file = a restarted process.
     let e2 = cached(&base, dir.path()).await;
     let b = e2.embed_batch(texts, &p("document")).await.unwrap();
-    assert_eq!(spent.load(Ordering::SeqCst), 2, "cache hit must not call the API");
+    assert_eq!(
+        spent.load(Ordering::SeqCst),
+        2,
+        "cache hit must not call the API"
+    );
     assert_eq!(a, b);
 }
 
@@ -103,9 +116,17 @@ async fn params_are_part_of_the_key() {
     let (base, spent) = spend_mock().await;
     let dir = tempfile::tempdir().unwrap();
     let e = cached(&base, dir.path()).await;
-    e.embed_batch(vec!["same".into()], &p("document")).await.unwrap();
-    e.embed_batch(vec!["same".into()], &p("query")).await.unwrap();
-    assert_eq!(spent.load(Ordering::SeqCst), 2, "a query vector is not a document vector");
+    e.embed_batch(vec!["same".into()], &p("document"))
+        .await
+        .unwrap();
+    e.embed_batch(vec!["same".into()], &p("query"))
+        .await
+        .unwrap();
+    assert_eq!(
+        spent.load(Ordering::SeqCst),
+        2,
+        "a query vector is not a document vector"
+    );
 }
 
 #[tokio::test]
@@ -114,7 +135,13 @@ async fn duplicates_in_a_batch_are_sent_once_and_order_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let e = cached(&base, dir.path()).await;
     let t = |s: &str| s.to_string();
-    let out = e.embed_batch(vec![t("aa"), t("b"), t("aa"), t("cccc"), t("b")], &p("document")).await.unwrap();
+    let out = e
+        .embed_batch(
+            vec![t("aa"), t("b"), t("aa"), t("cccc"), t("b")],
+            &p("document"),
+        )
+        .await
+        .unwrap();
     assert_eq!(spent.load(Ordering::SeqCst), 3);
     let lens: Vec<f32> = out.iter().map(|v| v[0]).collect();
     assert_eq!(lens, vec![2.0, 1.0, 2.0, 4.0, 1.0]);
@@ -125,10 +152,90 @@ async fn partial_hit_only_fetches_the_misses() {
     let (base, spent) = spend_mock().await;
     let dir = tempfile::tempdir().unwrap();
     let e = cached(&base, dir.path()).await;
-    e.embed_batch(vec!["known".into()], &p("document")).await.unwrap();
-    let out = e.embed_batch(vec!["x".into(), "known".into(), "yy".into()], &p("document")).await.unwrap();
+    e.embed_batch(vec!["known".into()], &p("document"))
+        .await
+        .unwrap();
+    let out = e
+        .embed_batch(
+            vec!["x".into(), "known".into(), "yy".into()],
+            &p("document"),
+        )
+        .await
+        .unwrap();
     assert_eq!(spent.load(Ordering::SeqCst), 3, "1 earlier + 2 misses");
-    assert_eq!(out.iter().map(|v| v[0]).collect::<Vec<_>>(), vec![1.0, 5.0, 2.0]);
+    assert_eq!(
+        out.iter().map(|v| v[0]).collect::<Vec<_>>(),
+        vec![1.0, 5.0, 2.0]
+    );
+}
+
+/// The measured 2026-09-28 failure (`cccrust index` on ~/PROJECTS/aosp-docs,
+/// 71k files): a second process holds a write transaction on the shared
+/// `~/.cccrust/embed_cache.db`, every pooled connection blocks inside SQLite's
+/// `busy_timeout`, and each remaining caller — reader or writer — dies with
+/// `PoolTimedOut` ("embed: pool timed out while waiting for an open connection").
+/// A cache miss is free; a dead index is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_long_writer_transaction_never_fails_a_caller() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("c.db");
+    let cache = EmbedCache::open(&db).await.unwrap();
+    let start = std::time::Instant::now();
+
+    // Another process (the aosp-docs index) holds a write transaction open.
+    let other = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&db)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+    let mut tx = other.begin().await.unwrap();
+    sqlx::query("INSERT INTO vectors (k, v) VALUES (?, ?)")
+        .bind(&[0u8; 32][..])
+        .bind(&[0u8; 4][..])
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // >=64 concurrent callers against the one EmbedCache, writes and reads.
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..8u8 {
+        let c = cache.clone();
+        set.spawn(async move {
+            let k = [i; 32];
+            let v = vec![i as f32; 3];
+            c.put_many(&[(k, v.as_slice())]).await
+        });
+    }
+    for i in 0..56u8 {
+        let c = cache.clone();
+        set.spawn(async move { c.get_many(&[[i.wrapping_add(128); 32]]).await.map(|_| ()) });
+    }
+    let mut errs = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Err(e) = r.unwrap() {
+            errs.push(format!("{e}"));
+        }
+    }
+    assert!(
+        errs.is_empty(),
+        "cache contention must degrade to a miss or a skipped put, never surface to the index: {errs:?}"
+    );
+    // Degrading is allowed; stalling is not. A wedged writer must not hold the
+    // index for anything like the 30s default that killed it on 2026-09-28.
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "64 callers against a wedged writer took {:?}",
+        start.elapsed()
+    );
+    drop(tx);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -140,10 +247,17 @@ async fn concurrent_callers_pay_once_for_the_same_text() {
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..50 {
         let e = e.clone();
-        set.spawn(async move { e.embed_batch(vec!["shared chunk".into()], &p("document")).await });
+        set.spawn(async move {
+            e.embed_batch(vec!["shared chunk".into()], &p("document"))
+                .await
+        });
     }
     while let Some(r) = set.join_next().await {
         assert_eq!(r.unwrap().unwrap()[0][0], 12.0);
     }
-    assert_eq!(spent.load(Ordering::SeqCst), 1, "one fetch for 50 concurrent identical requests");
+    assert_eq!(
+        spent.load(Ordering::SeqCst),
+        1,
+        "one fetch for 50 concurrent identical requests"
+    );
 }
