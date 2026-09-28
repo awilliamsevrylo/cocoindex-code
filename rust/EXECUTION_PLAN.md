@@ -33,7 +33,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 0 | port builds + e2e passes on a pinned engine | PASS | engine `3b617ff`; e2e_cli 46/0, e2e_advanced 21/0, cargo test 4/4 |
 | 1 | DO `connect()`+TLS returns a real Voyage vector; egress witnessed | PASS | 7/7 live; dims 1024; egress 104.28.166.239; parser 6/6 + mutation teeth |
 | 2 | 13 named DOs = 13 distinct sticky IPs; collision fails closed | PASS | run 1 caught 00/04/05 collision; placement re-homed 04,05 → 4/4, 65 calls 0 err |
-| 3 | `/v1/embeddings` router: token budget, per-slot 429 cooldown | — | |
+| 3 | `/v1/embeddings` router: token budget, per-slot 429 cooldown | PASS | unit 6/6, 4/4 mutants killed; live 9/9 incl. retrieval sanity |
 | 4 | Rust `ccc` indexes + searches through the Worker | — | |
 | 5 | client in-flight requests bounded | — | |
 | 6 | re-run never re-embeds finished chunks | — | |
@@ -140,6 +140,47 @@ instrument caught a real collision, so the fallback ran as written:
 05 → `-b1` 104.28.160.66. Re-witness `SLOTS=13 PINNED=1
 test/poc2-egress.sh` → **4/4 PASS**: control 5/5 distinct, 65 calls 0
 errors, sticky 13/13, **distinct 13/13**.
+
+## POC 3 — pass criteria (written before code)
+
+OpenAI-compatible `POST /v1/embeddings` on the router (bearer), body
+`{model, input: string[] | string, input_type?}` → `{object:"list",
+data:[{index, embedding}], model, usage:{total_tokens}}`.
+
+Engine `ApiEmbedder.build_body` sends only `{model, input}` — no
+`input_type`. So the router defaults `input_type: "document"`, and
+`POST /v1/embeddings/query` forces `"query"`. A `voyage/` model prefix is
+stripped before calling Voyage.
+
+1. **Order:** output `data[i].index == i` and vectors match input order
+   after the input is split across slots (unit: fake slots return tagged
+   vectors; merged order asserted).
+2. **Token budget:** no single Voyage call exceeds 120,000 estimated
+   tokens or 1,000 inputs (unit: oversize input must split into ≥2 calls).
+3. **429 re-route:** a slot answering 429 goes on cooldown (Retry-After,
+   else backoff) and its batch is retried on another slot; the request
+   still succeeds (unit: fake slot 0 always 429s).
+4. **Fail closed:** if every slot is cooling down or collided, return 503
+   `no_healthy_slot` — never a partial vector list.
+5. **Live:** one real 3-input request through the deployed router →
+   3 vectors, dims 1024, indices 0..2.
+
+### POC 3 — result (2026-09-28): PASS
+
+- `src/dispatch.ts` (pure core) + `src/embeddings.ts` (route). Batching
+  estimates tokens at 3 chars/token (over-splits, never under) under
+  120,000 tokens and 1,000 inputs per call.
+- Unit `test/dispatch.test.ts` 6/6. `test/mutate-dispatch.sh`: 4 mutants
+  (reverse merge order, 100x budget, disable re-route, drop cooldown) —
+  **all killed**, survivors=0.
+- Live `test/poc3-live.sh` **9/9**: 3 vectors, dims 1024, indices
+  [0,1,2], total_tokens 8; `/v1/embeddings/query` with a bare model id →
+  1024 dims; **retrieval sanity** — "how do I request a runtime
+  permission" scores "Android runtime permissions" highest; unknown model
+  surfaces Voyage's 400; no `pa-` in any response.
+- First live run failed 7/9 with `not_found`: the new route was not yet
+  being served right after deploy. Fix is in the instrument: gate on the
+  route under test (empty body → handler's 400), not on `/healthz`.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

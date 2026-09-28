@@ -3,6 +3,7 @@
 // router only holds a script_name binding to it (one DO class per script).
 import type { Env } from './slot';
 import { assignDistinct, baseName, PLACEMENT_DO, type SlotHome } from './placement';
+import { handleEmbeddings } from './embeddings';
 
 export { baseName as slotName };
 
@@ -58,6 +59,12 @@ export default {
     }
 
     if (url.pathname === '/placement') return json({ homes: await loadHomes(env) });
+
+    // OpenAI-compatible surface for the Rust ccc ApiEmbedder (base_url = /v1).
+    if (req.method === 'POST' && (url.pathname === '/v1/embeddings' || url.pathname === '/v1/embeddings/query')) {
+      const forceType = url.pathname.endsWith('/query') ? 'query' : null;
+      return handleEmbeddings(req, env, await loadHomes(env), forceType);
+    }
 
     if (url.pathname === '/probe') {
       const slot = Number(url.searchParams.get('slot') ?? '0');
