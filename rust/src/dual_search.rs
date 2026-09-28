@@ -98,7 +98,10 @@ impl RerankStatus {
 }
 
 /// The outcome of one dual-search call.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Not `PartialEq`: `QueryResult` (crate::schema) does not implement it, and
+/// this module does not own that type. Compare `paths`/`scores` in tests.
+#[derive(Debug, Clone)]
 pub struct DualSearchResult {
     /// Fused ranking (rerank-ordered if `rerank_status == Reranked`).
     pub results: Vec<QueryResult>,
