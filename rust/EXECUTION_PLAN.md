@@ -726,3 +726,261 @@ URL list: `corpus/jobs/android-docs-urls.mjs` regenerates
 only. The sitemap repeats every page for each `?hl=` locale: 64,925 of
 118,850 in-scope locations. Byte-order identical to the original 53,978
 shard list, minus 53 URLs the sitemap no longer lists.
+
+## POC 11 — voyage-code secondary index + dual search (criteria before code)
+
+Andrew: keep this in the product, not in one-off proof scripts. Secondary
+indexing, dual search, and fusion are **core library features** under
+`rust/src/`, exposed by the normal `cccrust` CLI, project `settings.yml`,
+the daemon protocol, and the MCP `search` tool. Rust tests own the proof;
+shell/Node scripts may collect live evidence but cannot satisfy a pass
+criterion by themselves.
+
+Measured before design:
+
+- Live request through the endpoint and bearer paths in
+  `~/.cccrust/global_settings.yml` (paths printed, values not printed): one
+  document input to `voyage/voyage-code-4` returned HTTP 200, one
+  **1024-dimension** vector, 19 prompt tokens. `voyage-code-4` is live;
+  the `voyage-code-3` fallback was not needed.
+- One project can hold independent SQLite vec0 databases: the database path
+  is an input to `open_target_db`, and each database owns its own
+  `ccc_index_meta`. Use stable role-based paths
+  `.cccrust/target_sqlite.db` and
+  `.cccrust/target_sqlite.secondary.db`; never put the model id in a path.
+- The current `process_file` combines split + embed. Calling `run_index`
+  twice would re-walk and re-chunk. The implementation must extract a
+  shared `PreparedChunk` stream and feed both embedders from it; a second
+  index is not allowed to run a second chunker pass.
+- The persistent embed cache is already safe across models: its key is
+  `sha256("v1", model, params, text)`. The secondary model and each model's
+  document/query parameters therefore occupy distinct keys.
+- `daemon.rs` is 775 lines and `main.rs` is 557 lines. Both already violate
+  the 300-line limit. New behavior belongs in new modules such as
+  `index_profiles.rs`, `multi_index.rs`, `dual_search.rs`, and `fusion.rs`;
+  do not grow those two files beyond thin dispatch wiring.
+
+Project config (the existing `embedding:` remains the primary):
+
+```yaml
+embedding:
+  provider: litellm
+  model: voyage/voyage-4
+  indexing_params: {input_type: document}
+  query_params: {input_type: query}
+secondary_embedding:
+  provider: litellm
+  model: voyage/voyage-code-4
+  indexing_params: {input_type: document}
+  query_params: {input_type: query}
+dual_search:
+  enabled_by_default: true
+  rrf_k: 60
+  weights:
+    primary: 1.0
+    secondary: 1.0
+```
+
+`cccrust init --secondary-model voyage/voyage-code-4
+[--secondary-provider litellm]` writes the secondary block. All fields are
+editable in `settings.yml`: secondary provider/model/params, whether dual
+is the default, RRF `k`, and both per-index weights. A project without
+`secondary_embedding` keeps today's single-index behavior and files.
+
+### POC 11a — secondary index is a first-class core feature
+
+**Proves:** one ordinary `cccrust index` run builds primary and secondary
+indexes from one shared chunk plan, with separate model metadata and
+model-scoped cached vectors.
+
+**Core design:**
+
+- `index_profiles.rs` resolves the named `primary` and optional `secondary`
+  profiles, their effective embedding settings, stable database paths, and
+  per-profile metadata. Invalid duplicate roles, missing model/provider,
+  or a configured secondary equal to the primary fail before indexing.
+- `multi_index.rs` owns the first-class index operation. It walks and chunks
+  every changed file once into `PreparedChunk` values, sends the same values
+  to both profile embedders, and commits each model's vectors to its own
+  database. Both embedders share one request budget, so total Worker
+  concurrency across profiles never exceeds `DEFAULT_MAX_INFLIGHT`.
+- `cccrust index` uses this operation whenever `secondary_embedding` exists;
+  there is no separate corpus script or hidden POC command. Incremental
+  re-runs and full clean re-embeds use the same command.
+- `cccrust status` prints one row per role: database path, model, dimensions,
+  files, and chunks. The daemon `ProjectStatus` response carries the same
+  structured per-index rows rather than flattening them into one count.
+- The core index report records per role: model, dimensions, files, chunks,
+  upstream inputs, upstream prompt tokens, cache hits, wall seconds, and
+  chunks/s. Cost totals come from parsed embedding responses, not log grep.
+
+**Pass criteria (all machine checked before POC 11b):**
+
+- [ ] Config round-trip tests preserve every `secondary_embedding` and
+      `dual_search` field; omitted fields deserialize to no secondary,
+      dual-on-when-secondary-exists, `rrf_k=60`, and weights 1.0/1.0.
+- [ ] A Rust integration test installs the current crate into a temporary
+      prefix, runs `cccrust init --secondary-model
+      voyage/voyage-code-4`, then runs that installed binary's ordinary
+      `cccrust index`; it creates exactly the primary and secondary target
+      DBs without invoking a witness script.
+- [ ] With deterministic fake embedders, both DBs contain exactly the same
+      set of `(file_path,start_line,end_line,content)` chunks, their
+      `ccc_index_meta` rows name different models and expected dimensions,
+      and at least one same-chunk vector differs between DBs.
+- [ ] A counting chunker sees exactly one chunk operation per changed file
+      while both DBs are built. A mutant that runs one independent indexer
+      per profile makes the test count two and fails.
+- [ ] The total fake HTTP server peak across both models is
+      `<= DEFAULT_MAX_INFLIGHT`, while its positive control with the shared
+      gate disabled exceeds that value.
+- [ ] `cache_key(primary_model, params, text) !=
+      cache_key(secondary_model, params, text)` and a two-model cache test
+      observes one upstream fetch per model, then zero on the second run.
+- [ ] `cccrust status` and daemon `ProjectStatus` report both roles with the
+      exact model, dimensions, chunk count, and database path read back from
+      each database; deleting one DB reports that role missing rather than
+      copying the other role's values.
+- [ ] The index report's prompt-token total equals the sum of a mock
+      server's per-response `usage.prompt_tokens`; a cache-only re-run
+      reports zero new upstream tokens.
+- [ ] Primary-only projects retain their existing DB paths, output, and e2e
+      results; all existing Rust unit/integration tests remain green.
+- [ ] **Reachability gate:** reachable from the installed `cccrust` binary with no script —
+      init, index, and status all exercise the secondary index through normal
+      commands.
+
+**Run:** `cargo test secondary_index -- --nocapture` plus a temporary-prefix
+`cargo install --path rust` binary test. Witness scripts may exercise the
+live Worker only after these tests pass.
+
+### POC 11b — weighted dual search + reciprocal-rank fusion
+
+**Proves:** core search embeds the query with both models' query parameters,
+searches both databases, and returns a deterministic, provenance-preserving
+merged ranking through CLI, daemon, and MCP.
+
+**Core design:**
+
+- `dual_search.rs` resolves search mode (`configured`, `primary`,
+  `secondary`, `dual`), validates each DB against its model metadata,
+  embeds the query separately with each profile's `query_params`, applies
+  all language/path filters to both searches, and passes ranked candidates
+  to `fusion.rs`.
+- Dual is recommended and is the default when a secondary exists. CLI
+  `cccrust search --dual` forces dual; `--primary-only` and
+  `--secondary-only` force an eval/debug arm. These mutually exclusive flags
+  override `dual_search.enabled_by_default`. With no secondary, configured
+  mode is primary and an explicit secondary/dual request fails clearly.
+- Weighted reciprocal-rank fusion is exactly
+  `sum(weight[index] / (rrf_k + rank[index]))`, with one-based ranks and
+  default `rrf_k=60`. `rrf_k` must be positive; weights must be finite and
+  non-negative, with at least one positive configured weight.
+- Dedupe key is exactly `(file_path,start_line,end_line)`. A fused result
+  retains one content payload plus `index_matches`, one entry per index that
+  found it: role, one-based rank, and that index's similarity score. Its
+  public `score` is the fused score in dual mode and similarity in a single
+  mode.
+- Daemon protocol change: `Request::Search` adds `mode: SearchMode`; search
+  response/result payloads add `search_mode`, final score, and
+  `index_matches`. Bump the package/protocol version so stale daemons restart.
+- MCP change: the `search` input schema adds `search_mode` with
+  `configured|primary|secondary|dual`; each JSON result returns
+  `score`, `search_mode`, and `index_matches`. CLI text keeps the existing
+  result header and adds a deterministic provenance line such as
+  `Indexes: primary rank=2 score=...; secondary rank=1 score=...`.
+
+**Pass criteria (all machine checked before POC 11c):**
+
+- [ ] A table-driven unit test covers single-index results, overlap,
+      primary-only/secondary-only candidates, ties, zero weight, non-default
+      weights, non-default `k`, and pagination. Expected fused scores are
+      asserted numerically from the formula, not snapshot text.
+- [ ] Fusion is invariant to the order in which index result lists arrive;
+      ties break by `(best_rank,file_path,start_line,end_line)` so repeated
+      runs are byte-identical. A mutant using arrival order fails.
+- [ ] Duplicate chunks from both DBs produce one output row with two
+      `index_matches`; distinct line ranges in the same file remain distinct.
+- [ ] A mock-wire test observes exactly two query embedding requests in dual
+      mode: the primary model with its configured query params and the
+      secondary model with its configured query params. Document params in
+      either request fail the test.
+- [ ] A Rust e2e fixture has a known answer outside the returned top list for
+      primary-only and secondary-only but inside the same-size dual list.
+      This proves fusion adds retrieval value rather than merely concatenating
+      two lists.
+- [ ] Installed-CLI tests prove configured default dual, explicit `--dual`,
+      `--primary-only`, and `--secondary-only`; conflicting flags exit
+      nonzero, and dual without a configured secondary exits nonzero with a
+      named remediation.
+- [ ] Daemon msgpack round-trip tests and an MCP JSON-RPC test preserve
+      `search_mode`, final score, per-index ranks, and per-index similarity
+      scores. MCP `tools/list` advertises the new enum and default behavior.
+- [ ] Existing single-index CLI/MCP output remains parseable, including the
+      existing `--- Result N (score: X) ---` header used by the android-docs
+      evaluator.
+- [ ] All new implementation lives in core `rust/src/` modules under 300
+      lines each; `daemon.rs` and `main.rs` receive dispatch wiring only and
+      do not absorb fusion/index orchestration logic.
+- [ ] **Reachability gate:** reachable from the installed `cccrust` binary with no script —
+      dual indexing/search, mode overrides, weights, and provenance are
+      exercised through the installed CLI and MCP server.
+
+**Run:** `cargo test fusion dual_search mcp -- --nocapture` plus the
+installed-binary e2e fixture. A script may format the live comparison, but
+it is not the implementation or the pass authority.
+
+### POC 11c — full Android corpus on voyage-4 + voyage-code-4
+
+**Proves:** the installed product builds and evaluates both real indexes at
+corpus scale through the Worker, and dual search does not lose overall
+hit@5 against the better single model.
+
+**Live configuration:** `~/PROJECTS/aosp-docs` with primary
+`voyage/voyage-4`, secondary `voyage/voyage-code-4`, dual default on,
+`rrf_k=60`, and weights 1.0/1.0. Use the Worker endpoint already configured
+for cccrust and the product's `DEFAULT_MAX_INFLIGHT`; use a fresh
+`CCCRUST_DIR`/embed cache for the measured full run so both model token
+counts are real rather than inherited cache hits.
+
+**Pass criteria:**
+
+- [ ] `cccrust index` from the installed binary exits 0 and builds both full
+      corpus DBs through the Worker. No POC-only indexer, direct curl loop,
+      or one-off embedding script is used.
+- [ ] `cccrust status` reports primary `voyage/voyage-4` and secondary
+      `voyage/voyage-code-4`, both 1024 dimensions, with identical file,
+      chunk, and `(file,line-range)` identity counts.
+- [ ] The aggregate live Worker concurrency for the two-index run never
+      exceeds `DEFAULT_MAX_INFLIGHT`; the exact configured/default value is
+      printed with the index report.
+- [ ] The six POC 9 known positives are first checked to exist on disk, then
+      dual search finds at least 5/6 in the top five, including the
+      extensionless giflib README and kernel `.rst` case.
+- [ ] Run
+      `~/PROJECTS/agent-skills/skills/android-docs/eval/run.mjs` with
+      `queries.tsv` three ways by passing normal cccrust modes: primary-only,
+      secondary-only, and dual. Preserve separate TSV artifacts for all three.
+- [ ] The report prints `n`, hit@1, and hit@5 for every query style
+      (`symbol`, `english`, `error`, `concept`, `compare`, `keyword`,
+      `platform`, `paraphrase`) and overall for each of the three modes; the
+      six control rows must remain 6/6 hit@5 or the runner is invalid.
+- [ ] Overall dual hit@5 is `>= max(primary hit@5, secondary hit@5)`. If it
+      is lower, POC 11c does not pass: retain all measurements and report the
+      finding honestly instead of changing the gate or hiding a style.
+- [ ] The report also lists every per-style dual regression versus the better
+      single model, even when the overall hit@5 gate passes.
+- [ ] Record total wall seconds, files, chunks, chunks/s, cache hits,
+      upstream inputs, and `usage.prompt_tokens` separately for primary and
+      secondary and combined. Token totals must reconcile exactly with the
+      core index report.
+- [ ] Re-run the same ordinary `cccrust index` without clearing cache: both
+      DBs remain complete and new upstream prompt tokens are zero, proving
+      the full-corpus operation is first-class and resumable.
+- [ ] **Reachability gate:** reachable from the installed `cccrust` binary with no script —
+      the complete corpus build and all three search modes use normal installed
+      commands; scripts only orchestrate/query and summarize the evidence.
+
+**Run:** installed `cccrust index`, POC 9 queries in dual mode, then the
+android-docs evaluator in primary/secondary/dual modes. Commit and push the
+criteria before any POC 11 product code starts.
