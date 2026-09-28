@@ -40,15 +40,22 @@ const inject = [
 ].map((f) => readFileSync(f, 'utf8'));
 
 const browser = await chromium.launch({ args: ['--disable-dev-shm-usage'] });
-const page = await browser.newPage();
-await page.route('**/*', (r) => (['image', 'font', 'media', 'stylesheet'].includes(r.request().resourceType()) ? r.abort() : r.continue()));
-await page.goto('https://developer.android.com/robots.txt', { waitUntil: 'domcontentloaded' });
-for (const src of inject) await page.addScriptTag({ content: src });
+// A fresh page (new renderer heap) every RECYCLE batches caps any per-page
+// growth: one long-lived page decayed 327 → 130 pages/min over 450 URLs.
+const RECYCLE = arg('--recycle', 8);
+let page = null;
+async function freshPage() {
+  if (page) await page.close();
+  page = await browser.newPage();
+  await page.goto('https://developer.android.com/robots.txt', { waitUntil: 'domcontentloaded' });
+  for (const src of inject) await page.addScriptTag({ content: src });
+}
 
 const t0 = Date.now();
 let ok = 0, bad = 0;
 const statuses = {};
-for (let i = 0; i < todo.length; i += BATCH) {
+for (let i = 0, b = 0; i < todo.length; i += BATCH, b++) {
+  if (b % RECYCLE === 0) await freshPage();
   const res = await page.evaluate(([u, c]) => window.__crawl(u, c), [todo.slice(i, i + BATCH), CONC]);
   for (const r of res) {
     statuses[r.status] = (statuses[r.status] ?? 0) + 1;

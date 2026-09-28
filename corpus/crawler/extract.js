@@ -59,6 +59,14 @@
     return { md: `# ${(art.title || '').trim()}\n\n${td.turndown(holder).trim()}`, via: 'readability' };
   }
 
+  function slim(html) {
+    const a = html.indexOf('<article');
+    const z = a < 0 ? -1 : html.indexOf('</article>', a);
+    const h = html.indexOf('</head>');
+    if (a < 0 || z < 0 || h < 0) return html; // no article: Readability needs the full page
+    return `${html.slice(0, h + 7)}<body>${html.slice(a, z + 10)}</body></html>`;
+  }
+
   async function one(url) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -68,7 +76,11 @@
           continue;
         }
         if (!r.ok) return { url, ok: false, status: r.status };
-        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+        // Reference pages are ~2.2 MB, almost all nav; parsing the whole thing
+        // grew the renderer to 3.3 GB and the rate fell 327 → 130 pages/min
+        // (POC 10b). Parse only <head> + <article> (~66 KB) when present.
+        const html = await r.text();
+        const doc = new DOMParser().parseFromString(slim(html), 'text/html');
         const out = extract(doc, r.url || url);
         if (!out || out.md.length < 40) return { url, ok: false, status: r.status, err: 'empty' };
         return { url, ok: true, status: r.status, md: `<!-- source: ${url} -->\n\n${out.md}\n`, via: out.via };
