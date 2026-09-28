@@ -120,3 +120,68 @@ async fn http_error_surfaces_status_without_the_key() {
     assert!(err.contains("401"), "{err}");
     assert!(!err.contains("sekrit-key"), "key leaked into error: {err}");
 }
+
+/// Serve exactly `count` sequential requests; return (base_url, handle -> Vec<body Value>).
+async fn mock_n(
+    count: usize,
+) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let mut bodies = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let (head_end, content_len) = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    break (p + 4, len);
+                }
+            };
+            while buf.len() < head_end + content_len {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body: Value = serde_json::from_slice(&buf[head_end..head_end + content_len]).unwrap();
+            let input_count = body["input"].as_array().map(|a| a.len()).unwrap_or(0);
+            let vectors: Vec<Value> = (0..input_count)
+                .map(|i| json!({"index": i, "embedding": [i as f32]}))
+                .collect();
+            let response = json!({"data": vectors}).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            bodies.push(body);
+        }
+        bodies
+    });
+    (base, handle)
+}
+
+#[tokio::test]
+async fn batch_exceeding_max_batch_is_split_sequentially() {
+    // Default max batch is 64. Sending 66 items must result in 2 requests (64 + 2).
+    let (base, h) = mock_n(2).await;
+    let e = RemoteEmbedder::new("voyage-4-large", &base, None).unwrap();
+    let inputs: Vec<String> = (0..66).map(|i| format!("doc {i}")).collect();
+    let v = e.embed_batch(inputs, &Params::new()).await.unwrap();
+    assert_eq!(v.len(), 66);
+    let bodies = h.await.unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["input"].as_array().unwrap().len(), 64);
+    assert_eq!(bodies[1]["input"].as_array().unwrap().len(), 2);
+    assert_eq!(bodies[0]["input"][0], "doc 0");
+    assert_eq!(bodies[0]["input"][63], "doc 63");
+    assert_eq!(bodies[1]["input"][0], "doc 64");
+    assert_eq!(bodies[1]["input"][1], "doc 65");
+}

@@ -54,8 +54,34 @@ async fn attempt(e: &RemoteEmbedder, texts: &[String], params: &Params) -> Resul
     }
 }
 
+pub const DEFAULT_MAX_BATCH: usize = 64;
+
+fn max_batch_size() -> usize {
+    std::env::var("CCC_EMBED_MAX_BATCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_BATCH)
+}
+
 /// Embed `texts` with the retry / split policy. Never logs the key.
 pub async fn fetch(e: &RemoteEmbedder, texts: Vec<String>, params: &Params) -> Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_batch = max_batch_size();
+    if texts.len() > max_batch {
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(max_batch) {
+            let part = fetch_single_batch(e, chunk.to_vec(), params).await?;
+            out.extend(part);
+        }
+        return Ok(out);
+    }
+    fetch_single_batch(e, texts, params).await
+}
+
+async fn fetch_single_batch(e: &RemoteEmbedder, texts: Vec<String>, params: &Params) -> Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -75,7 +101,7 @@ pub async fn fetch(e: &RemoteEmbedder, texts: Vec<String>, params: &Params) -> R
             Action::Split => {
                 let right = texts[texts.len() / 2..].to_vec();
                 let left = texts[..texts.len() / 2].to_vec();
-                let (a, b) = tokio::try_join!(Box::pin(fetch(e, left, params)), Box::pin(fetch(e, right, params)))?;
+                let (a, b) = tokio::try_join!(Box::pin(fetch_single_batch(e, left, params)), Box::pin(fetch_single_batch(e, right, params)))?;
                 return Ok(a.into_iter().chain(b).collect());
             }
             Action::Fail => {
