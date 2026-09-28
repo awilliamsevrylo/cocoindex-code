@@ -13,7 +13,9 @@ const rows = readFileSync(join(outDir, 'MANIFEST.tsv'), 'utf8').trim().split('\n
   .map((l) => l.split('\t')).filter((r) => r[1] === 'ok');
 const urlToFile = (u) => (new URL(u).pathname.replace(/^\//, '').replace(/\/$/, '') || 'index')
   .split('/').map((s) => s.replace(/[^a-zA-Z0-9._-]/g, '_')).join('/') + '.md';
-const words = (s) => (s.replace(/<!--.*?-->/gs, '').replace(/```[\s\S]*?```/g, ' ')
+// Code counts as content: Jina emits code blocks unfenced, ours are fenced,
+// so stripping fences made our own code read as "missing" (run 2: 0.891).
+const words = (s) => (s.replace(/<!--.*?-->/gs, '')
   .replace(/\]\([^)]*\)/g, ']').toLowerCase().match(/[a-z][a-z0-9_]{3,}/g) || []);
 
 // The Jina reference carries its own envelope (Title:/URL Source:/Markdown
@@ -24,7 +26,10 @@ const words = (s) => (s.replace(/<!--.*?-->/gs, '').replace(/```[\s\S]*?```/g, '
 const refBody = (s) => {
   const lines = s.split('\n');
   const start = lines.findIndex((l) => /^# \S/.test(l));
-  let end = lines.findIndex((l, i) => i > start && /^Was this helpful\?/.test(l.trim()));
+  // The widget is not always introduced by "Was this helpful?" (run 2: agde,
+  // reference pages) — its JSON line is the reliable end marker.
+  let end = lines.findIndex((l, i) => i > start
+    && (/^Was this helpful\?/.test(l.trim()) || /easyToUnderstand|Need to tell us more/.test(l)));
   if (end < 0) end = lines.length;
   return lines.slice(Math.max(start, 0), end).filter((l) => !/arrow_forward|arrow_back/.test(l)).join('\n');
 };
