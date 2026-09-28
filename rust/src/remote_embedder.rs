@@ -16,7 +16,7 @@
 //!   otherwise lives in `~/.cccrust/embed_cache.db`.
 //! - `CCC_EMBED_RETRIES` (default 8) / `CCC_EMBED_TIMEOUT_S` (default 120):
 //!   see `retry.rs` / `http_fetch.rs` for the fault policy.
-//! - `CCC_EMBED_MAX_INFLIGHT` — cap on concurrent HTTP requests (default 16).
+//! - `CCC_EMBED_MAX_INFLIGHT` — cap on concurrent HTTP requests (default 32, the POC 8 knee).
 //!   The indexer fans out one call per file with no limit of its own, so
 //!   this is the only thing standing between a big corpus and a request storm.
 
@@ -35,7 +35,7 @@ const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1";
 /// litellm-style provider prefix; Voyage (and the Worker) take the bare id.
 const VOYAGE_PREFIX: &str = "voyage/";
 const DEFAULT_TIMEOUT_S: u64 = 120;
-pub const DEFAULT_MAX_INFLIGHT: usize = 16;
+pub const DEFAULT_MAX_INFLIGHT: usize = 32;
 
 #[derive(Clone)]
 pub struct RemoteEmbedder {

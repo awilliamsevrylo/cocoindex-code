@@ -41,7 +41,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 5 | client in-flight bounded; Worker spreads load across slots | PASS | 1K files peak 8 (control 732); live 26 reqs → 13/13 slots, 2 each; 7/7 + 5/5 mutants |
 | 6 | re-run never re-embeds finished chunks | PASS | reset re-run spend 0 (control 200); kill -9 resume 403/403 limit; 100 identical files → 2; 4/4 mutants |
 | 7 | fault suite (429, oversize, slow, 401, leak) has teeth | PASS | e2e 8/8 incl. retries=0 control + leak positive control; 9/9 mutants |
-| 8 | measured throughput picks slot count | — | |
+| 8 | measured throughput picks slot count | PASS | cap 32 = 479 chunks/s, 13.1x 1-key direct; 3 product fixes (7e510af, d5159ef, 8ccfc94) |
 | 9 | Android docs corpus fully indexed | — | |
 
 ## POC 0 — result (2026-09-28): PASS, first pin
@@ -477,8 +477,86 @@ Witness `tests/poc7-faults.sh` — mock fault modes, zero spend:
   to `settings_paths.rs` (re-exported, callers unchanged).
 - Regression: cargo 33/33, e2e 46/0 + 21/0, 4c 7/7.
 
+## POC 8 — pass criteria (written before code)
+
+Slice: 1,000 files sampled deterministically (sorted, every k-th) from
+the corpus snapshot pulled to `~/PROJECTS/aosp-docs` (23,139 files
+at the time). Real Voyage via the Worker, `voyage-4-large`. Each run gets
+a fresh `CCCRUST_DIR` (empty embed cache) so no run is free.
+
+Arms, same slice, measured wall time + chunks + client retry lines (the
+`embed retry` WARN in daemon.log) + Worker 429 re-routes:
+
+- **A — 1 key direct:** `CCC_EMBED_BASE_URL=https://api.voyageai.com/v1`,
+  one key from `~/.drew/voyage.keys` via a 0600 temp file, cap 1.
+  (The Python baseline shape: one request at a time.)
+- **B — Worker, cap 4 / 16 / 32** (13 slots × ≤2 in flight = 26 max).
+
+Pass = every arm indexes 1,000/1,000 files with rc 0, numbers recorded
+as chunks/s and retries, and the default `CCC_EMBED_MAX_INFLIGHT` is set
+from the measured knee (smallest cap within 10% of the best chunks/s),
+not from a guess. The report says which arm won and by how much.
+
+**Revision after the first live arm (w16, rc=1, 0 files):** real API
+reference pages broke two Worker assumptions.
+- A 120K-*estimated* batch was **126,899** real tokens — 3 chars/token
+  under-counts dense reference text. Voyage answered 400 "max allowed
+  tokens per submitted batch is 120000".
+- The Worker wrapped that 400 as **502**, so the client retried a
+  non-retryable error 9 times (the POC 7 policy was right; the status
+  was wrong).
+Fix criteria (Worker):
+  a. a Voyage 400 naming the token/batch limit splits that batch in half
+     and retries the halves (unit: fake slot rejects > N inputs → all
+     vectors returned, in order); a single oversize input still fails;
+  b. other Voyage 4xx surface as the same 4xx (not 502), so clients fail
+     fast (unit + live bad-model check returns 400);
+  c. budget lowered to 100,000 estimated tokens per call (headroom, not
+     a guess: 126,899 / 120,000 = 1.06 measured overshoot);
+  d. mutation: drop the split → (a) dies; map 4xx → 502 → (b) dies.
+
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved
 and a DO can relocate after eviction, so the router must re-check a slot's
 egress IP periodically and refuse a slot whose IP now collides — placement
 is a snapshot, not a guarantee.
+
+## POC 8 — result (2026-09-28): PASS
+
+Final arms, same 1,000-file slice, fresh `CCCRUST_DIR` each, after the
+three product fixes below (source: `workers/voyage-egress/test/poc8-results.tsv`):
+
+| arm | model | cap | files | chunks | secs | chunks/s | client retries |
+|---|---|---|---|---|---|---|---|
+| direct (1 key) | voyage-4-large | 1 | 1000 | 14,857 | 406 | 36.6 | 0 |
+| worker | voyage-4-large | 16 | 1000 | 14,857 | 53 | 280.3 | 0 |
+| worker | voyage-4-large | 32 | 1000 | 14,857 | 31 | 479.3 | 1 |
+| worker | voyage-4-large | 64 | 1000 | 14,857 | 30 | 495.2 | 1 |
+| worker | voyage-4 | 32 | 1000 | 14,857 | 54 | 275.1 | 0 |
+| worker | voyage-4 | 64 | 1000 | 14,857 | 37 | 401.5 | 1 |
+
+- [x] every arm 1,000/1,000 files, rc 0
+- [x] knee: best 495.2 (cap 64); smallest cap within 10% = **32** (479.3)
+  → `DEFAULT_MAX_INFLIGHT` 16 → 32 (`remote_embedder.rs`)
+- [x] winner: Worker cap 32 is **13.1x** the 1-key direct baseline
+  (479.3 vs 36.6 chunks/s); cap 64 buys only +3%
+- voyage-4 (asked for by Andrew for the big fan-out) is **slower** here
+  than voyage-4-large: 275 vs 479 at cap 32, 402 vs 495 at cap 64. Voyage
+  answered voyage-4 13/13 at 360 inputs directly, so it is per-request
+  latency (max 10.9 s vs 6.4 s for v4-large at 13-way), not throttling.
+
+Defects the arms found, each fixed **in product code with a regression
+test**, not worked around in the POC script:
+
+1. Worker wrapped Voyage's 400 as 502; no oversize split — `7e510af`.
+2. Client: Voyage's real body ("max allowed tokens ... TOO_MANY_TOKENS_IN_BATCH")
+   matched none of `says_too_large()`'s phrases → Fail after 1 attempt
+   (direct arm rc 1). Extensionless READMEs (6/1000) not indexed — `d5159ef`.
+3. Worker: 2,511 retries (all 500) on voyage-4 arms. `wrangler tail`:
+   "runtime canceled this request because ... code had hung" — a waiter
+   in `SlotScheduler.acquire` blocked on another request's release().
+   Wait now owns a 50 ms re-poll timer — `8ccfc94`. Live: 13/13, 13/13,
+   40/40 at 360-input batches (was 8–9/13).
+
+The mutation for each: phrase list removed → 6/7; README patterns removed
+→ walk test fails; scheduler timer removed → 22/23.
