@@ -96,3 +96,7 @@ impl FilePathMatcher for GitignoreAwareMatcher {
         !self.ignored(path, false) && self.base.is_file_included(path)
     }
 }
+
+#[cfg(test)]
+#[path = "walk_tests.rs"]
+mod tests;

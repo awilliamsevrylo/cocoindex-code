@@ -21,7 +21,10 @@ pub enum Action {
 /// Body phrases Voyage / OpenAI-compatible servers use for oversize batches.
 fn says_too_large(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
-    ["too many tokens", "token limit", "maximum context", "too long", "too large", "max_tokens", "exceeds"]
+    [
+        "too many tokens", "too_many_tokens", "max allowed tokens", "token limit",
+        "maximum context", "too long", "too large", "max_tokens", "exceeds",
+    ]
         .iter()
         .any(|p| b.contains(p))
 }
@@ -106,6 +109,14 @@ mod tests {
         assert_eq!(c(Some(400), "Request has too many tokens", 4, 0), Action::Split);
         assert_eq!(c(Some(413), "payload too large", 2, 0), Action::Split);
         assert_eq!(c(Some(400), "too many tokens", 1, 0), Action::Fail);
+    }
+
+    /// The exact body Voyage returned in POC 8's direct arm (2026-09-28).
+    /// Before this test the client failed it after 1 attempt instead of splitting.
+    #[test]
+    fn real_voyage_batch_token_limit_splits() {
+        let body = r#"{"detail":"Request to model 'voyage-4-large' failed. The max allowed tokens per submitted batch is 120000. Your batch has 126899 tokens after truncation. Please lower the number of tokens in the batch.","error_code":"TOO_MANY_TOKENS_IN_BATCH"}"#;
+        assert_eq!(c(Some(400), body, 360, 0), Action::Split);
     }
 
     #[test]

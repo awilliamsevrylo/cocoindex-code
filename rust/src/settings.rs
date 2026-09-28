@@ -19,6 +19,9 @@ pub const DEFAULT_INCLUDED_PATTERNS: &[&str] = &[
     "**/*.vue", "**/*.css", "**/*.scss", "**/*.json", "**/*.xml", "**/*.yaml", "**/*.yml",
     "**/*.toml", "**/*.sol", "**/*.pas", "**/*.dpr", "**/*.dtd", "**/*.f", "**/*.f90", "**/*.f95",
     "**/*.f03",
+    // Extensionless / odd-suffix docs (README, README.git, README.windows):
+    // POC 8 found 6 of 1,000 corpus files silently skipped without these.
+    "**/README", "**/README.*",
 ];
 
 pub const DEFAULT_EXCLUDED_PATTERNS: &[&str] = &[
