@@ -7,6 +7,8 @@
 
 export class NoHealthySlot extends Error {}
 
+export const WAIT_POLL_MS = 50;
+
 export class SlotScheduler {
   private inflight = new Map<number, number>();
   private waiters: Array<() => void> = [];
@@ -39,7 +41,14 @@ export class SlotScheduler {
         this.inflight.set(best, this.load(best) + 1);
         return best;
       }
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      // A wait resolved only by ANOTHER request's release() leaves this request
+      // with no I/O of its own; workerd cancels it as hung (measured: 4/13
+      // requests threw under 13-way load). The timer keeps the wait owned by
+      // this request and re-polls even if the wakeup is lost.
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve);
+        setTimeout(resolve, WAIT_POLL_MS);
+      });
     }
   }
 

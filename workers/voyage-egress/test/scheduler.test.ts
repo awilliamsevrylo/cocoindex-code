@@ -45,6 +45,21 @@ test('per-slot cap holds under 40 concurrent requests, all complete', async () =
   SLOTS.forEach((s) => assert.equal(sched.load(s), 0, `slot ${s} leaked a permit`));
 });
 
+// workerd cancels a request whose only pending work is a promise another
+// request must resolve. Model that as a LOST wakeup: the queued acquire must
+// still make progress on its own timer once capacity frees.
+test('a queued acquire progresses without a cross-request wakeup', async () => {
+  const sched = new SlotScheduler(1);
+  const cool = new Map<number, number>();
+  const first = await sched.acquire([0], cool, Date.now);
+  const second = sched.acquire([0], cool, Date.now);
+  await sleep(5);
+  (sched as unknown as { waiters: unknown[] }).waiters.length = 0; // drop the wakeup
+  sched.release(first);
+  const got = await Promise.race([second, sleep(1000).then(() => 'hung')]);
+  assert.equal(got, 0, 'queued acquire never woke');
+});
+
 test('a throwing slot call still releases its permit', async () => {
   const sched = new SlotScheduler(1);
   const boom: SlotCall = async () => { throw new Error('socket reset'); };
