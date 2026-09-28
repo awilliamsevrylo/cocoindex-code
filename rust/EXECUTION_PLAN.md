@@ -42,7 +42,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 6 | re-run never re-embeds finished chunks | PASS | reset re-run spend 0 (control 200); kill -9 resume 403/403 limit; 100 identical files → 2; 4/4 mutants |
 | 7 | fault suite (429, oversize, slow, 401, leak) has teeth | PASS | e2e 8/8 incl. retries=0 control + leak positive control; 9/9 mutants |
 | 8 | measured throughput picks slot count | PASS | cap 32 = 479 chunks/s, 13.1x 1-key direct; 3 product fixes (7e510af, d5159ef, 8ccfc94) |
-| 9 | Android docs corpus fully indexed | — | |
+| 9 | Android docs corpus fully indexed | 9a PASS · 9b pending crawl | snapshot 22,104 files, 270,828 chunks, 676 s, 6/6 positives (voyage-4) |
 
 ## POC 0 — result (2026-09-28): PASS, first pin
 
@@ -560,3 +560,56 @@ test**, not worked around in the POC script:
 
 The mutation for each: phrase list removed → 6/7; README patterns removed
 → walk test fails; scheduler timer removed → 22/23.
+
+## POC 9 — pass criteria (written before code)
+
+**Proves:** `cccrust` indexes the real Android docs corpus through the
+Worker, is searchable, and a re-run after the crawl grows pays only for
+new files.
+
+Model: **voyage-4** (Andrew, 2026-09-28: "try voyage-4 for the large
+fanout"), set per index with `cccrust init --index-model voyage/voyage-4`
+— the POC 4b override, not a global change. POC 8 measured it at 275
+chunks/s (cap 32) vs 479 for voyage-4-large; accepted cost of the ask.
+
+Durable harness: `rust/tests/poc9-corpus.sh` + `rust/tests/poc9-queries.tsv`
+(query → expected path substring). Re-runnable after every corpus pull.
+
+9a — index the current snapshot (`~/PROJECTS/aosp-docs`, 23,139 files):
+- [ ] `cccrust index` rc 0; files, chunks and wall seconds recorded
+- [ ] status reports index model `voyage/voyage-4`
+- [ ] instrument check first: every expected path in the queries file
+      exists on disk (a missing file would make a miss meaningless)
+- [ ] ≥ 5 of 6 known-positive queries put their expected file in the top 5,
+      including one extensionless README (the POC 8 include fix) and one
+      kernel `.rst`
+- [ ] negative control: a query for a term absent from the corpus does not
+      return the expected files of the positives in its top 5
+
+9b — after the crawl lanes finish (full pull):
+- [ ] re-pull, re-run `poc9-corpus.sh`; rc 0
+- [ ] cost of re-run ∝ new files: Worker requests on the re-run ≤ the
+      new-file share of the first run's requests + 10% (memo + embed cache)
+- [ ] same query set still ≥ 5/6
+
+### POC 9a — result (2026-09-28): PASS
+
+`bash rust/tests/poc9-corpus.sh` on the snapshot (23,139 files):
+- [x] index rc 0 in **676 s**; 22,104 files, **270,828 chunks** (~400 chunks/s)
+- [x] status reports `voyage/voyage-4`
+- [x] instrument: all 6 expected files exist on disk
+- [x] known positives in top 5: **6/6** — fragment lifecycle, compose
+      lifecycle, permissions overview, IBinder reference, kernel
+      `cgroup-v2.rst`, extensionless `giflib/README`
+- [x] negative control (nonsense query) returned kernel yaml/xml noise,
+      none of the 6 positives
+- client retries: 4 (Worker 502s, all recovered)
+
+Unindexed files accounted for: 23,139 − 22,104 = 1,035. Of those, 1,015 match
+no include pattern and 7 are dotfiles. The biggest prose group in that set is
+extensionless kernel ABI docs (`Documentation/ABI/**/sysfs-*`); the rest is
+gif/pdf/emz/dot/Makefile. **Open:** whether to add a project-level include
+for `**/Documentation/ABI/**` — this is a corpus policy, not a default.
+
+9b waits on the crawl lanes: 14,690 of 53,978 pages at 11:25 UTC; 8 lost
+lanes were relaunched 11:08 UTC from their Wasabi manifests.

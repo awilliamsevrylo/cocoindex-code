@@ -1,0 +1,7 @@
+query	expected_path_substring
+how does a fragment move through its lifecycle states when the user navigates	android-docs/guide/fragments/lifecycle.md
+when does a composable recompose and leave the composition	android-docs/develop/ui/compose/lifecycle.md
+runtime permissions dangerous permission request flow	android-docs/guide/topics/permissions/overview.md
+IBinder transact interface for remote objects	android-docs/reference/android/os/IBinder.md
+cgroup v2 unified hierarchy controllers	kernel_common/Documentation/admin-guide/cgroup-v2.rst
+GIF image library reading and writing legacy format	platform_external_giflib/README
