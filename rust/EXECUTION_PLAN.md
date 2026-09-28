@@ -660,7 +660,26 @@ reference, compose, training, studio, kotlin):**
 
 Then POC 9b runs on the new corpus.
 
-### POC 10a — result (2026-09-28): PASS
+### POC 10a — result (2026-09-28): REVOKED / UNREPRODUCIBLE
+
+**Status: REVOKED 2026-09-28 (fix round 1c, commit `76ad389`).** The PASS below
+is historical and must not be cited. Reasons:
+- **The sample is gone.** `out10a`/`ref10a` lived only in the ephemeral lane
+  `/tmp/home`; both `pw-crawl-00` and `pw-crawl-01` measured EMPTY on
+  re-check (adv-corpus verifier, steps 5 and 12). Nothing can be re-scored.
+- **Self-loosened instrument.** Recall went 0.780 → 0.891 → 0.987 through the
+  orchestrator's own gate changes (`4c9b40c`, `6fb96c7`), not extractor
+  changes. The `6fb96c7` end-marker also cut the reference at a mid-body
+  widget JSON line, which inflates recall (reproduced by the verifier).
+- **Mean-only gate.** A 0.2-recall page hides inside a ≥0.9 mean; the
+  pass/fail line never looked at single pages.
+
+**New gate** (`corpus/crawler/check-quality.mjs`, `76ad389`): every page
+recall ≥ **0.80** (floor) AND mean ≥ **0.90**; the widget JSON ends the
+reference only after its last heading. The out/ref sample dirs are argv and
+must be **persisted to Wasabi** before a re-run counts. Re-run pending.
+
+Historical record (superseded):
 
 On `pw-crawl-00`, Playwright v1.55.0 image, 24 URLs across 12 doc sections,
 compared against fresh keyless Jina fetches of the same URLs (`check-quality.mjs`):
@@ -682,7 +701,8 @@ The first bench ran at **39.4 pages/min** at conc 4. That was a defect, not the 
 - Reference pages are ~2.2 MB, almost all nav. DOMParser takes ~60 ms on the
   full page vs 3 ms on `<head>`+`<article>` (66 KB).
 - Fix `725032a`: parse only that slice, and recycle the page every 8 batches.
-  10a re-gated after the fix: still 0.987.
+  10a re-gated after the fix: still 0.987 (under the old, since-revoked gate;
+  see POC 10a above).
 
 Disjoint 450-URL slice per arm, one instance (2 vCPU):
 
