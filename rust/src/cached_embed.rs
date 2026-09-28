@@ -47,12 +47,19 @@ pub async fn embed_cached(
         };
         let items: Vec<(Key, &[f32])> =
             claim.owned.iter().map(|(k, _)| *k).zip(fetched.iter().map(|v| v.as_slice())).collect();
-        let put = cache.put_many(&items).await;
+        // Write-through is best effort: the vectors are already in hand, so a
+        // cache that cannot take them costs the next run a fetch, never this
+        // one its results. `put_many` absorbs every write error internally; the
+        // one Err it can still return is a PoolTimedOut acquire at the 300s cap
+        // (reachable at ~150 concurrent callers against a wedged writer), and
+        // that must not surface here either.
+        if let Err(err) = cache.put_many(&items).await {
+            tracing::warn!("embed cache write-through skipped: {err:#}");
+        }
         for ((k, _), v) in claim.owned.iter().zip(fetched) {
             got.insert(*k, Arc::new(v));
         }
         flight.finish(claim.owned, &got);
-        put?;
     }
 
     // Keys another caller owned: wait; if its fetch failed, fetch ourselves.
@@ -81,3 +88,7 @@ pub async fn embed_cached(
     }
     Ok(out.into_iter().map(|v| v.expect("filled")).collect())
 }
+
+#[cfg(test)]
+#[path = "cached_embed_tests.rs"]
+mod tests;

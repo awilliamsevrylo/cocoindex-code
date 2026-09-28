@@ -101,6 +101,18 @@ impl EmbedCache {
         Ok(Self { inner: open_inner(path).await })
     }
 
+    /// Test seam: close the single writer pool, so the next `put_many`'s
+    /// `acquire()` fails *now* instead of after the real 300s cap. That cap is
+    /// reachable in production (~150 concurrent callers against a wedged
+    /// writer) and is the only way `put_many` can still return `Err`; the
+    /// call site must survive it. No double: the pool is the real one.
+    #[cfg(test)]
+    pub(crate) async fn close_writer_for_test(&self) {
+        if let Some(inner) = &self.inner {
+            inner.write.close().await;
+        }
+    }
+
     /// One slot per key, `None` on a miss. An unreadable cache is all misses:
     /// the caller then pays for a fetch it would have paid for anyway.
     pub async fn get_many(&self, keys: &[Key]) -> Result<Vec<Option<Vec<f32>>>> {
