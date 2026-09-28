@@ -16,6 +16,19 @@ const urlToFile = (u) => (new URL(u).pathname.replace(/^\//, '').replace(/\/$/, 
 const words = (s) => (s.replace(/<!--.*?-->/gs, '').replace(/```[\s\S]*?```/g, ' ')
   .replace(/\]\([^)]*\)/g, ']').toLowerCase().match(/[a-z][a-z0-9_]{3,}/g) || []);
 
+// The Jina reference carries its own envelope (Title:/URL Source:/Markdown
+// Content:), the page TOC and the feedback widget. First 10a run: every word
+// "missing" from ours on the two worst pages was that chrome, not body text.
+// Score only the reference's article body: its H1 up to "Was this helpful?",
+// minus the next-page nav line.
+const refBody = (s) => {
+  const lines = s.split('\n');
+  const start = lines.findIndex((l) => /^# \S/.test(l));
+  let end = lines.findIndex((l, i) => i > start && /^Was this helpful\?/.test(l.trim()));
+  if (end < 0) end = lines.length;
+  return lines.slice(Math.max(start, 0), end).filter((l) => !/arrow_forward|arrow_back/.test(l)).join('\n');
+};
+
 let h1 = 0, leaks = 0, fences = 0, tables = 0, recallSum = 0, recallN = 0;
 const lowRecall = [];
 for (const [url] of rows) {
@@ -29,10 +42,10 @@ for (const [url] of rows) {
   const ref = refPath && existsSync(refPath) ? readFileSync(refPath, 'utf8') : null;
   if (ref) {
     const ours = new Set(words(md));
-    const theirs = [...new Set(words(ref))];
+    const theirs = [...new Set(words(refBody(ref)))];
     const r = theirs.filter((w) => ours.has(w)).length / Math.max(theirs.length, 1);
     recallSum += r; recallN++;
-    if (r < 0.9) lowRecall.push(`${r.toFixed(2)} ${url}`);
+    if (r < 0.9) lowRecall.push(`${r.toFixed(2)} ${url}\n      missing: ${theirs.filter((w) => !ours.has(w)).slice(0, 25).join(' ')}`);
   }
 }
 const n = rows.length, recall = recallN ? recallSum / recallN : NaN;
