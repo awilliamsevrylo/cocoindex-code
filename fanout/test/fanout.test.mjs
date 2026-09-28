@@ -88,14 +88,15 @@ function mockExec(manifest) {
     if (command.includes('echo alive; else echo idle')) return wrap('idle');
     if (command.includes('wc -c <')) return wrap(String(gz.length));
     if (command.includes('tail -c +')) return wrap(gz.toString('base64'));
-    const part = /printf '%s' '([^']*)' > '([^']*)\.fxpart\.(\d+)'/.exec(command);
+    // Upload parts are namespaced by a per-upload nonce: `<path>.fxpart.<nonce>.<seq>`.
+    const part = /printf '%s' '([^']*)' > '([^']*)\.fxpart\.[0-9a-f]+\.(\d+)'/.exec(command);
     if (part) { (uploads[part[2]] ||= []).push(part[1]); return wrap(''); }
-    const fin = /cat '([^']*)\.fxpart'\.\*/.exec(command);
+    const fin = /cat '([^']*?)\.fxpart\.[0-9a-f]+'/g.exec(command);
     if (fin) {
       let b = Buffer.from(uploads[fin[1]].join(''), 'base64');
       if (command.includes('gunzip')) b = (await import('node:zlib')).gunzipSync(b);
       uploads[fin[1]] = b;
-      return wrap(createHash('sha256').update(b).digest('hex'));
+      return wrap('done'); // the finalize command reports done|uptodate|notok
     }
     if (command.includes('nohup bash run.sh')) return wrap('started 4242');
     return wrap('');

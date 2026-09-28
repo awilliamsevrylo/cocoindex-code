@@ -4,11 +4,11 @@
 // keeps an append-only MANIFEST.tsv (`item\tok|FAIL\t...`); a (re)start pulls
 // the lane's finished set and uploads only the remainder. Every remote step
 // is idempotent, so the transport may retry any call.
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
 export const MIN_LANES = 5;
@@ -27,6 +27,10 @@ export function gcloudTransport(credPath = join(homedir(), '.local/state/gcloud-
       try {
         const res = await fetch(cred.url, {
           method: 'POST',
+          // A hung lane must fail here, not hold the caller forever: undici's
+          // defaults stretch one stuck call to ~300 s, and the retry loop would
+          // then pay that four times. Client-side ceiling = server budget + 30 s.
+          signal: AbortSignal.timeout(Math.min(timeoutMs, 300000) + 30000),
           headers: { ...cred.headers, 'Content-Type': 'application/json', 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': 'tools/call', 'Mcp-Name': 'shell_exec' },
           body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call',
             params: { name: 'shell_exec', arguments: { command, singleton: lane.singleton, image: lane.image, timeoutMs: Math.min(timeoutMs, 300000) } } }),
@@ -35,7 +39,13 @@ export function gcloudTransport(credPath = join(homedir(), '.local/state/gcloud-
         let j; try { j = JSON.parse(text); } catch { throw new Error(`HTTP ${res.status} from gcloud-ssh-mcp`); }
         if (j.error) throw new Error(`rpc ${j.error.code}: ${String(j.error.message).slice(0, 200)}`);
         return (j.result?.content || []).map((c) => c.text).join('\n');
-      } catch (e) { last = e; await sleep(2000 * 2 ** attempt); }
+      } catch (e) {
+        last = e;
+        // A client abort is a dead/hung lane, not a transient transport blip:
+        // each retry would pay the full timeout again. One refusal is the verdict.
+        if (e.name === 'TimeoutError' || e.name === 'AbortError') break;
+        await sleep(2000 * 2 ** attempt);
+      }
     }
     throw new Error(`lane ${lane.singleton}: transport failed: ${last.message}`);
   };
@@ -69,6 +79,17 @@ export function shard(items, lanes) {
 function listFiles(root, sub = '') {
   const out = [];
   for (const e of readdirSync(join(root, sub), { withFileTypes: true })) {
+    // A symlink is followed only while it resolves to a *file* that is still
+    // inside the root. A symlinked directory is skipped: following one can walk
+    // a cycle forever, or pull in a whole tree the caller never named, and the
+    // item list would silently grow. The README says exactly this.
+    if (e.isSymbolicLink()) {
+      let real; try { real = realpathSync(join(root, sub, e.name)); } catch { continue; } // dangling
+      if (!real.startsWith(root + '/')) continue; // escapes the root
+      if (!statSync(real).isFile()) continue;     // dir symlink / socket / fifo
+      out.push(sub ? `${sub}/${e.name}` : e.name);
+      continue;
+    }
     const rel = sub ? `${sub}/${e.name}` : e.name;
     if (e.isDirectory()) out.push(...listFiles(root, rel));
     else if (e.isFile()) out.push(rel);
@@ -87,29 +108,69 @@ export function loadItems(src) {
 export const remainder = (items, ok) => items.filter((i) => !ok.has(i));
 
 // ── byte transfer in ≤48 KB calls (idempotent parts, sha256-verified) ──
+// Eight digits, not five: `cat pre.*` orders by name, so a five-digit index
+// misorders the moment an upload passes 99,999 parts (a >4.8 GB base64 body).
+const partName = (i) => String(i).padStart(8, '0');
+// Every upload owns a private part namespace (`<path>.fxpart.<nonce>.NNNNNNNN`)
+// and stages into `<path>.fxtmp.<nonce>`. Two uploads of one path therefore
+// never share a file: each either verifies its own bytes and atomically renames
+// them into place (last writer wins), or fails without touching the target.
+// The transport is at-least-once, so a repeated finalize must be a no-op that
+// leaves a verified file alone rather than re-deriving it from deleted parts.
 export async function upload(exec, lane, path, buf, { gzip = false } = {}) {
+  const want = sha256(buf);
   const b64 = (gzip ? gzipSync(buf) : Buffer.from(buf)).toString('base64');
   const parts = Math.max(1, Math.ceil(b64.length / CHUNK_B64));
-  const pre = `${path}.fxpart`;
+  const nonce = randomBytes(8).toString('hex');
+  const pre = `${path}.fxpart.${nonce}`;
+  const tmp = `${path}.fxtmp.${nonce}`;
+  // Note the space after `$(`: `$((` is bash ARITHMETIC expansion, so the
+  // command form must never start a `$(`-group with a parenthesised command.
+  const sum = ` (sha256sum ${shq(tmp)} 2>/dev/null || shasum -a 256 ${shq(tmp)}) | cut -c1-64`;
+  // `-e` not `-s`: a zero-byte payload still has one (empty) part file, and an
+  // empty-but-present part is data, not absence.
+  const have = Array.from({ length: parts }, (_, i) => `[ -e ${shq(`${pre}.${partName(i)}`)} ]`).join(' && ');
+  const decode = `  if ${have} && cat ${shq(pre)}.* | base64 -d ${gzip ? '| gunzip -c ' : ''}> ${shq(tmp)}` +
+    ` && [ "$(${sum})" = '${want}' ] && mv -f ${shq(tmp)} ${shq(path)}; then`;
+  const finalize = [
+    `if [ ! -e ${shq(path)} ]; then`, // fast path: nothing there yet
+    decode,
+    `    rm -f ${shq(pre)}.* ${shq(tmp)}; echo done`,
+    '  else',
+    `    rm -f ${shq(tmp)}; echo notok`,
+    '  fi',
+    `elif [ "$(${sum.replace(shq(tmp), shq(path))})" = '${want}' ]; then`, // already committed
+    '  echo uptodate',
+    'else',
+    decode,
+    `    rm -f ${shq(pre)}.* ${shq(tmp)}; echo done`,
+    '  else',
+    `    rm -f ${shq(tmp)}; echo notok`,
+    '  fi',
+    'fi',
+  ].join('\n');
   for (let i = 0; i < parts; i++) {
     const piece = b64.slice(i * CHUNK_B64, (i + 1) * CHUNK_B64);
-    const clear = i === 0 ? `rm -f ${shq(pre)}.*; ` : '';
-    const r = await run(exec, lane, `mkdir -p ${shq(dirname(path))} && ${clear}printf '%s' '${piece}' > ${shq(`${pre}.${String(i).padStart(5, '0')}`)}`);
+    const r = await run(exec, lane, `mkdir -p ${shq(dirname(path))} && printf '%s' '${piece}' > ${shq(`${pre}.${partName(i)}`)}`);
     if (r.rc) throw new Error(`upload ${path} part ${i} on ${lane.singleton}: ${r.text}`);
   }
-  const r = await run(exec, lane, `cat ${shq(pre)}.* | base64 -d ${gzip ? '| gunzip -c ' : ''}> ${shq(path)} && rm -f ${shq(pre)}.* && (sha256sum ${shq(path)} 2>/dev/null || shasum -a 256 ${shq(path)}) | cut -c1-64`);
-  if (r.rc || r.text.trim() !== sha256(buf)) throw new Error(`upload ${path} on ${lane.singleton}: checksum mismatch (${r.text.slice(0, 120)})`);
+  const r = await run(exec, lane, finalize);
+  if (r.rc || !/^(done|uptodate)$/.test(r.text.trim())) throw new Error(`upload ${path} on ${lane.singleton}: checksum mismatch (${r.text.slice(0, 120)})`);
   return { bytes: buf.length, calls: parts + 1 };
 }
 export async function download(exec, lane, path) {
-  const s = await run(exec, lane, `if [ -f ${shq(path)} ]; then wc -c < ${shq(path)}; else echo -1; fi`);
+  // Snapshot first: the live file may be appended to (MANIFEST.tsv) between the
+  // size probe and the slices, which would trip the length check spuriously.
+  const snap = `${path}.fxsnp.${randomBytes(8).toString('hex')}`;
+  const s = await run(exec, lane, `if [ -f ${shq(path)} ]; then cp ${shq(path)} ${shq(snap)} && wc -c < ${shq(snap)}; else echo -1; fi`);
   const size = parseInt(s.text.trim(), 10);
   if (!(size >= 0)) return null;
   const bufs = [];
   for (let off = 0; off < size; off += RAW_SLICE) {
-    const r = await run(exec, lane, `tail -c +${off + 1} ${shq(path)} | head -c ${RAW_SLICE} | base64 | tr -d '\\n'`);
+    const r = await run(exec, lane, `tail -c +${off + 1} ${shq(snap)} | head -c ${RAW_SLICE} | base64 | tr -d '\\n'`);
     bufs.push(Buffer.from(r.text.trim(), 'base64'));
   }
+  await run(exec, lane, `rm -f ${shq(snap)}`);
   const buf = Buffer.concat(bufs);
   if (buf.length !== size) throw new Error(`download ${path} on ${lane.singleton}: got ${buf.length} of ${size} bytes`);
   return buf;
@@ -130,6 +191,10 @@ export function normalizeSpec(spec, specDir = '.') {
   if (!spec.items || !spec.worker) throw new Error('spec needs items and worker');
   const image = spec.image || 'node:22-slim';
   const names = spec.laneNames || Array.from({ length: lanes }, (_, i) => `${spec.lanePrefix || spec.name}-${i}`);
+  // M1: a laneNames list of the wrong length is silent item loss in one
+  // direction (fewer names: the tail of `shard()` is never iterated) and a
+  // TypeError in the other (more names: `shards[i]` is undefined). Refuse.
+  if (names.length !== lanes) throw new Error(`spec.laneNames has ${names.length} entries but spec.lanes is ${lanes}`);
   return {
     remoteBase: '/tmp/home/fanout', syncEverySec: 300, maxAttempts: 5, env: {}, ...spec, lanes, image,
     items: resolve(specDir, spec.items),
@@ -142,8 +207,14 @@ export const laneRoot = (spec, i) => `${spec.remoteBase}/${spec.name}/lane-${i}`
 // ── lane scripts ──
 const ALIVE = `alive(){ [ -n "$1" ] || return 1; if [ -d /proc ]; then [ -r /proc/$1/cmdline ] && tr '\\0' ' ' < /proc/$1/cmdline | grep -q run.sh; else kill -0 "$1" 2>/dev/null; fi; }`;
 function runScript(spec, i, root) {
+  const extra = Object.entries(spec.env || {});
+  for (const [k] of extra) {
+    // The key lands in `export <k>=` unquoted, so it is the one part of this
+    // line a shell reads as syntax. Quoting it is not possible; refuse instead.
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(k)) throw new Error(`spec.env key must match [A-Z_][A-Z0-9_]*: ${JSON.stringify(k)}`);
+  }
   const env = { ITEMS_FILE: `${root}/items.txt`, OUT_DIR: `${root}/out`, IN_DIR: `${root}/in`,
-    LANE: spec.lane[i].singleton, LANE_INDEX: String(i), FANOUT_NAME: spec.name, ...spec.env };
+    LANE: spec.lane[i].singleton, LANE_INDEX: String(i), FANOUT_NAME: spec.name, ...Object.fromEntries(extra) };
   return ['#!/usr/bin/env bash', ...Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}`),
     `cd ${shq(root)}`, 'mkdir -p "$OUT_DIR" "$IN_DIR"', 'rm -f done', 'SP=',
     `if [ -s sync.sh ]; then ( while sleep ${Number(spec.syncEverySec)}; do bash sync.sh >> sync.log 2>&1; done ) & SP=$!; fi`,
