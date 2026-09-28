@@ -1,10 +1,13 @@
 // voyage-egress Worker: routes embedding requests to per-key Durable Objects.
 // The VoyageSlot class lives in the separate "voyage-slot" script; this
 // router only holds a script_name binding to it (one DO class per script).
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import type { Env } from './slot';
 import { assignDistinct, baseName, PLACEMENT_DO, type SlotHome } from './placement';
+import { coreEmbed, embeddingsErrorResponse, voyageModel } from './embeddings';
 import { handleEmbeddings } from './embeddings';
-import { handleRerank } from './rerank';
+import { coreRerank, handleRerank, NotPlacedError } from './rerank';
+import { NoHealthySlot } from './scheduler.ts';
 
 export { baseName as slotName };
 
@@ -88,3 +91,50 @@ export default {
     return json({ error: 'not_found' }, 404);
   },
 } satisfies ExportedHandler<Env>;
+
+// RPC entrypoint for service-binding callers (named export alongside the
+// default fetch handler — workers/runtime-apis/bindings/service-bindings/rpc.mdx
+// "Named entrypoints"). Reuses the SAME core as the HTTP routes: dispatch()
+// with the shared pool from src/pool.ts, placement homes, and cooldowns.
+// RPC errors propagate to the caller as exceptions, so each method maps the
+// core's sentinel errors to its own typed shape (owner rule: RPC-first).
+export class EmbedRPC extends WorkerEntrypoint<Env> {
+  async embed(
+    texts: string[],
+    model: string,
+    inputType: 'document' | 'query',
+  ): Promise<{ vectors: number[][]; usage_tokens: number }> {
+    if (!Array.isArray(texts) || texts.length === 0 || !texts.every((s) => typeof s === 'string')) {
+      throw new Error('texts must be a non-empty string[]');
+    }
+    if (typeof model !== 'string' || model.length === 0) throw new Error('model required');
+    const r = await coreEmbed(this.env, await loadHomes(this.env), texts, voyageModel(model), inputType);
+    return { vectors: r.vectors, usage_tokens: r.usage_tokens };
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    model?: string,
+    topK?: number,
+  ): Promise<{ status: number; body: string; retry_after_ms?: number }> {
+    if (typeof query !== 'string' || query.length === 0) throw new Error('query required');
+    if (!Array.isArray(documents) || documents.length === 0 || !documents.every((d) => typeof d === 'string')) {
+      throw new Error('documents must be a non-empty string[]');
+    }
+    if (typeof model !== 'string' || model.length === 0) throw new Error('model required');
+    return coreRerank(this.env, await loadHomes(this.env), query, documents, model, topK);
+  }
+
+  // Called for any HTTP request that reaches this named entrypoint directly
+  // (e.g. via env.SERVICE.fetch()) — no external routes here by design.
+  override async fetch(): Promise<Response> {
+    return new Response(JSON.stringify({ error: 'embedrpc_no_http_surface' }), {
+      status: 404,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+}
+
+// Exported for the RPC test surface so error mapping is testable in isolation.
+export { embeddingsErrorResponse, NotPlacedError, NoHealthySlot };
