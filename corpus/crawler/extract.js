@@ -59,17 +59,27 @@
     return { md: `# ${(art.title || '').trim()}\n\n${td.turndown(holder).trim()}`, via: 'readability' };
   }
 
-  // The devsite article: <article ... class="... devsite-article ...">, searched
-  // only AFTER </head> so an `<article` string inside a head <script> never
-  // counts. Nested <article> elements are depth-counted to the matching close.
-  // Anything unexpected returns the FULL page (slower, never truncated).
+  // The devsite article: <article ... class="... devsite-article ...">. A
+  // well-formed page searches after </head>. A malformed/unclosed head searches
+  // from byte zero but skips matches inside <script>, so it stays slim without
+  // letting script text impersonate the body. Nested articles are depth-counted.
   const DEVSITE_ARTICLE = /<article\b[^>]*\bclass=["'](?:[^"']*\s)?devsite-article(?:\s[^"']*)?["']/i;
+  function articleFrom(html, from) {
+    let at = from;
+    while (at < html.length) {
+      const m = DEVSITE_ARTICLE.exec(html.slice(at));
+      if (!m) return -1;
+      const found = at + m.index;
+      const before = html.slice(0, found).toLowerCase();
+      if (before.lastIndexOf('<script') <= before.lastIndexOf('</script>')) return found;
+      at = found + m[0].length;
+    }
+    return -1;
+  }
   function slim(html) {
-    const h = html.indexOf('</head>');
-    if (h < 0) return html;
-    const m = DEVSITE_ARTICLE.exec(html.slice(h));
-    if (!m) return html; // no devsite article: Readability needs the full page
-    const a = h + m.index;
+    const h = html.toLowerCase().indexOf('</head>');
+    const a = articleFrom(html, h < 0 ? 0 : h);
+    if (a < 0) return html; // no devsite article: Readability needs the full page
     const tag = /<(\/?)article\b[^>]*>/gi;
     tag.lastIndex = a;
     let depth = 0, t;
@@ -77,7 +87,8 @@
       depth += t[1] ? -1 : 1;
       if (depth === 0) {
         const z = t.index + t[0].length;
-        return `${html.slice(0, h + 7)}<body>${html.slice(a, z)}</body></html>`;
+        const head = h < 0 ? '<html><head></head>' : html.slice(0, h + 7);
+        return `${head}<body>${html.slice(a, z)}</body></html>`;
       }
     }
     return html; // unbalanced: parse the whole page rather than truncate

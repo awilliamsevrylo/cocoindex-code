@@ -59,7 +59,7 @@ is_asset() {
 }
 done_status() { awk -F'\t' -v r="$1" '$1==r && $2=="ok" {f=1} END{exit !f}' "$MANIFEST"; }
 record() { # item status branch files bytes
-  local okf=ok; case "$2" in *FAIL) okf=FAIL ;; esac
+  local okf=ok; case "$2" in *FAIL|BAD_NAME) okf=FAIL ;; esac
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$okf" "$2" "$3" "$4" "$5" >> "$MANIFEST"
 }
 

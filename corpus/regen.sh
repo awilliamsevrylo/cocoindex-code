@@ -38,8 +38,9 @@ F=$(idx "$FROM"); T=$(idx "$TO")
 [ "$F" -ge 0 ] && [ "$T" -ge "$F" ] || { echo "bad --from/--to (stages: ${STAGES[*]})" >&2; exit 2; }
 
 JOBS=(corpus/jobs/android-docs.json corpus/jobs/aosp-docs.json)
-URLS_FILE=corpus/jobs/android-docs-urls.txt
-AOSP_ITEMS=corpus/jobs/aosp-docs-items.txt
+URLS_FILE="${ANDROID_URLS_FILE:-corpus/jobs/android-docs-urls.txt}"
+AOSP_ITEMS="${AOSP_ITEMS_FILE:-corpus/jobs/aosp-docs-items.txt}"
+URL_BASELINE="${ANDROID_URL_BASELINE:-53925}"
 DEST="${CORPUS_DEST:-$HOME/PROJECTS/aosp-docs}"
 CCC="${CCC_BIN:-$ROOT/rust/target/release/cccrust}"
 MIN_PCT="${GATE_MIN_PCT:-98}"
@@ -62,18 +63,26 @@ pct() { awk -v n="$1" -v d="$2" 'BEGIN { print (d > 0) ? int(100 * n / d) : 0 }'
 
 # End-to-end completeness. Every source must reach MIN_PCT.
 gate() {
-  local bad=0 urls md disk idxd items okitems p
-  urls=$(grep -c '^https://' "$URLS_FILE")
+  local bad=0 urls=0 expected invalid=0 md disk idxd items=0 okitems p
+  if [ ! -r "$URLS_FILE" ]; then echo "  FAIL android URL list missing: $URLS_FILE"; bad=1
+  else
+    urls=$(grep -c '^https://' "$URLS_FILE" || true)
+    invalid=$(grep -vc '^https://' "$URLS_FILE" || true)
+  fi
+  expected=$urls; [ "$expected" -lt "$URL_BASELINE" ] && expected=$URL_BASELINE
   md=$( [ -d "$DEST/android-docs" ] && find "$DEST/android-docs" -type f -name '*.md' | wc -l | tr -d ' ' || echo 0)
   disk=$( [ -d "$DEST" ] && find "$DEST" -type f ! -path '*/.cccrust/*' ! -name MANIFEST.tsv ! -name '.*' | wc -l | tr -d ' ' || echo 0)
   idxd=$( (cd "$DEST" 2>/dev/null && "$CCC" status 2>/dev/null) | grep -oE 'Files: +[0-9]+' | grep -oE '[0-9]+' | head -1)
-  items=$(grep -c . "$AOSP_ITEMS")
+  if [ ! -r "$AOSP_ITEMS" ]; then echo "  FAIL AOSP item list missing: $AOSP_ITEMS"; bad=1
+  else items=$(grep -c . "$AOSP_ITEMS" || true); fi
   okitems=$( [ -f "$DEST/MANIFEST.tsv" ] && awk -F'\t' '$1 == "aosp-docs" && $4 == "ok" {print $3}' "$DEST/MANIFEST.tsv" | sort -u | wc -l | tr -d ' ' || echo 0)
   check() { # label num den
     p=$(pct "$2" "$3")
     if [ "$p" -ge "$MIN_PCT" ]; then echo "  ok   $1: $2/$3 = $p%"; else echo "  FAIL $1: $2/$3 = $p% (< $MIN_PCT%)"; bad=1; fi
   }
-  check "android md on disk vs URL list" "$md" "$urls"
+  check "android URL list vs baseline" "$urls" "$URL_BASELINE"
+  [ "$invalid" -eq 0 ] || { echo "  FAIL android URL list invalid lines: $invalid"; bad=1; }
+  check "android md on disk vs expected URLs" "$md" "$expected"
   check "aosp manifest ok items vs item list" "$okitems" "$items"
   if [ -z "$idxd" ]; then echo "  FAIL files indexed: cccrust status unreadable ($CCC in $DEST)"; bad=1
   else check "files indexed vs files on disk" "$idxd" "$disk"; fi

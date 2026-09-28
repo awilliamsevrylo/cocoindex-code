@@ -35,6 +35,16 @@ test('floor: one 0.2-recall page inside a 0.95 mean fails', () => {
   assert.notEqual(r.rc, 0, `gate passed with a 0.2 page hidden in the mean:\n${r.out}`);
 });
 
+test('mean: every page above the floor still fails when the mean is below 0.90', () => {
+  const refWords = W('m', 100);
+  const kept = refWords.slice(0, 85).join(' ');
+  const pages = Array.from({ length: 3 }, (_, i) => [`mean${i}`, kept, ref(`mean${i}`, refWords.join(' '))]);
+  const r = sample(pages);
+  assert.match(r.out, /min page recall 0\.8[0-9][0-9] >= 0\.8/);
+  assert.match(r.out, /mean body word recall vs ref 0\.8[0-9][0-9] >= 0\.9/);
+  assert.notEqual(r.rc, 0, `the mean gate was bypassed even though every page cleared the floor:\n${r.out}`);
+});
+
 test('mid-body widget JSON line does not truncate the scored reference', () => {
   const head = W('h', 20), tail = W('t', 20);
   // The crawled page has only the head section; the reference has the tail

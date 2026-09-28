@@ -28,6 +28,17 @@ test('unreachable remote (network error) is a FAIL, never SKIP_DEAD', () => {
   assert.notEqual(r.rc, 0);
 });
 
+test('unsafe repo names are BAD_NAME before any path mutation', () => {
+  const t = tmp('sweep-escape-');
+  const marker = join(t, 'marker');
+  write(marker, 'must survive\n');
+  const r = sweep(`file://${t}`, ['../../marker@main'], { WORK_DIR: join(t, 'work') });
+  assert.equal(r.rows.length, 1, r.out);
+  assert.deepEqual(r.rows[0].slice(1, 3), ['FAIL', 'BAD_NAME'], r.out);
+  assert.ok(existsSync(marker), 'unsafe item escaped the sweep work/output roots');
+  assert.notEqual(r.rc, 0);
+});
+
 test('reachable remote with no refs is SKIP_DEAD (ok)', () => {
   const t = tmp('sweep-remote-');
   git(t, 'init', '-q', '--bare', 'empty.git');

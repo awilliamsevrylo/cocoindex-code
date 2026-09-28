@@ -32,9 +32,17 @@ test('nested <article>: text after the inner close is kept', () => {
 });
 
 test('`<article` inside a head <script> does not hijack the slice', () => {
-  const head = '<script>var t = "<article class=\\"x\\">fake</article>";</script>';
+  const head = '<script>var t = "<article class=\"devsite-article\">fake</article>";</script>';
   const out = slim(page(head, ART('<p>REAL-BODY</p>')));
   assert.match(out, /<body><article class="devsite-article"><p>REAL-BODY<\/p><\/article><\/body>/);
+});
+
+test('unclosed head still slims from the first body devsite article', () => {
+  const html = '<html><head><script>var t = "<article class=\"devsite-article\">fake</article>";</script>'
+    + '<body><nav>NAV</nav><article class="devsite-article"><p>REAL</p></article><footer>F</footer></body></html>';
+  const out = slim(html);
+  assert.match(out, /REAL/);
+  assert.doesNotMatch(out, /NAV|fake|<footer>/, 'malformed head must not force a full-page parse or select script text');
 });
 
 test('unbalanced article falls back to the full page (never truncates)', () => {
