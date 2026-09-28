@@ -14,6 +14,8 @@
 //!   `VOYAGE_API_KEY`. The key is never included in errors or logs.
 //! - `CCC_EMBED_CACHE=off` disables the vector cache (`embed_cache.rs`), which
 //!   otherwise lives in `~/.cccrust/embed_cache.db`.
+//! - `CCC_EMBED_RETRIES` (default 8) / `CCC_EMBED_TIMEOUT_S` (default 120):
+//!   see `retry.rs` / `http_fetch.rs` for the fault policy.
 //! - `CCC_EMBED_MAX_INFLIGHT` — cap on concurrent HTTP requests (default 16).
 //!   The indexer fans out one call per file with no limit of its own, so
 //!   this is the only thing standing between a big corpus and a request storm.
@@ -22,7 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{OnceCell, Semaphore};
 
@@ -33,33 +34,23 @@ use crate::embedder_params::Params;
 const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1";
 /// litellm-style provider prefix; Voyage (and the Worker) take the bare id.
 const VOYAGE_PREFIX: &str = "voyage/";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_TIMEOUT_S: u64 = 120;
 pub const DEFAULT_MAX_INFLIGHT: usize = 16;
 
 #[derive(Clone)]
 pub struct RemoteEmbedder {
-    client: reqwest::Client,
-    base_url: String,
+    pub(crate) client: reqwest::Client,
+    pub(crate) base_url: String,
     /// Model id as configured (identity for change detection).
     model: String,
-    api_key: Option<String>,
+    pub(crate) api_key: Option<String>,
     dimension: Arc<OnceCell<usize>>,
     /// Shared by every clone, so the cap holds across all concurrent files.
-    inflight: Arc<Semaphore>,
+    pub(crate) inflight: Arc<Semaphore>,
     cache: Option<EmbedCache>,
     flight: SingleFlight,
-}
-
-#[derive(Deserialize)]
-struct EmbeddingResponse {
-    data: Vec<EmbeddingData>,
-}
-
-#[derive(Deserialize)]
-struct EmbeddingData {
-    #[serde(default)]
-    index: Option<usize>,
-    embedding: Vec<f32>,
+    pub(crate) max_retries: u32,
+    pub(crate) timeout: Duration,
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -95,7 +86,6 @@ impl RemoteEmbedder {
             bail!("CCC_EMBED_MAX_INFLIGHT must be at least 1");
         }
         let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| anyhow!("building HTTP client: {e}"))?;
         Ok(Self {
@@ -107,7 +97,15 @@ impl RemoteEmbedder {
             inflight: Arc::new(Semaphore::new(max_inflight)),
             cache: None,
             flight: SingleFlight::default(),
+            max_retries: crate::retry::DEFAULT_RETRIES,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_S),
         })
+    }
+
+    pub fn with_policy(mut self, max_retries: u32, timeout: Duration) -> Self {
+        self.max_retries = max_retries;
+        self.timeout = timeout;
+        self
     }
 
     pub fn with_cache(mut self, cache: Option<EmbedCache>) -> Self {
@@ -132,7 +130,15 @@ impl RemoteEmbedder {
             Some(v) => v.parse().map_err(|_| anyhow!("CCC_EMBED_MAX_INFLIGHT={v:?} is not a number"))?,
             None => DEFAULT_MAX_INFLIGHT,
         };
-        Self::with_max_inflight(model, &base, resolve_api_key()?, cap)
+        let num = |name: &str, default: u64| -> Result<u64> {
+            match env_nonempty(name) {
+                Some(v) => v.parse().map_err(|_| anyhow!("{name}={v:?} is not a number")),
+                None => Ok(default),
+            }
+        };
+        let retries = num("CCC_EMBED_RETRIES", crate::retry::DEFAULT_RETRIES as u64)? as u32;
+        let timeout = Duration::from_secs(num("CCC_EMBED_TIMEOUT_S", DEFAULT_TIMEOUT_S)?);
+        Ok(Self::with_max_inflight(model, &base, resolve_api_key()?, cap)?.with_policy(retries, timeout))
     }
 
     pub fn model(&self) -> &str {
@@ -158,33 +164,9 @@ impl RemoteEmbedder {
         }
     }
 
-    /// One HTTP request, no cache.
+    /// One logical request (retries, split-on-oversize), no cache.
     pub(crate) async fn fetch(&self, texts: Vec<String>, params: &Params) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let url = format!("{}/embeddings", self.base_url);
-        // Held until the response body is read: the slot is busy until then.
-        let _permit = self.inflight.acquire().await.map_err(|_| anyhow!("embedder closed"))?;
-        let mut req = self.client.post(&url).json(&self.body(&texts, params));
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("embedding request to {url} failed: {}", e.without_url()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let mut text = resp.text().await.unwrap_or_default();
-            text.truncate(400);
-            bail!("embedding request to {url} failed ({status}): {text}");
-        }
-        let parsed: EmbeddingResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("embedding response decode failed: {e}"))?;
-        order_vectors(parsed.data, texts.len())
+        crate::http_fetch::fetch(self, texts, params).await
     }
 
     /// Embedding dimension, probed once with `probe_params` and cached.
@@ -198,23 +180,6 @@ impl RemoteEmbedder {
             .await?;
         Ok(*dim)
     }
-}
-
-/// Put vectors back in input order (by `index` when present) and refuse a
-/// short or malformed response instead of mis-assigning vectors to chunks.
-fn order_vectors(data: Vec<EmbeddingData>, expected: usize) -> Result<Vec<Vec<f32>>> {
-    if data.len() != expected {
-        bail!("embedding API returned {} vectors for {expected} inputs", data.len());
-    }
-    let mut out: Vec<Option<Vec<f32>>> = vec![None; expected];
-    for (pos, d) in data.into_iter().enumerate() {
-        let i = d.index.unwrap_or(pos);
-        let slot = out.get_mut(i).ok_or_else(|| anyhow!("embedding index {i} out of range"))?;
-        if slot.replace(d.embedding).is_some() {
-            bail!("embedding index {i} returned twice");
-        }
-    }
-    Ok(out.into_iter().map(|v| v.expect("every index filled")).collect())
 }
 
 #[cfg(test)]

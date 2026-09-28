@@ -40,7 +40,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 4c | renamed `cccrust`; own `~/.cccrust` + `.cccrust/`; never reads Python config | PASS | isolation 7/7 incl. poison control; e2e 46/0 + 21/0 |
 | 5 | client in-flight bounded; Worker spreads load across slots | PASS | 1K files peak 8 (control 732); live 26 reqs → 13/13 slots, 2 each; 7/7 + 5/5 mutants |
 | 6 | re-run never re-embeds finished chunks | PASS | reset re-run spend 0 (control 200); kill -9 resume 403/403 limit; 100 identical files → 2; 4/4 mutants |
-| 7 | fault suite (429, oversize, slow) has teeth | — | |
+| 7 | fault suite (429, oversize, slow, 401, leak) has teeth | PASS | e2e 8/8 incl. retries=0 control + leak positive control; 9/9 mutants |
 | 8 | measured throughput picks slot count | — | |
 | 9 | Android docs corpus fully indexed | — | |
 
@@ -427,6 +427,55 @@ Witness against the local mock, which counts inputs it receives (the
   first draft "survived" only because it did not compile).
 - Regression: e2e 46/0 + 21/0, POC 4 7/7, 4b 11/11, 4c 7/7, 5 4/4, all
   mutation scripts survivors=0.
+
+## POC 7 — pass criteria (written before code)
+
+Today any non-200 fails the whole file. Policy (`src/retry.rs`, pure
+`classify(status, body) → Retry(delay) | Split | Fail`, unit-tested):
+
+- 429 / 500 / 502 / 503 / 504, connect errors, timeouts → retry with
+  exponential backoff + jitter, honoring `Retry-After`; at most
+  `CCC_EMBED_RETRIES` (default 8), cap 60 s.
+- 400/413 whose body says the batch is too large (tokens/too long/size)
+  and batch > 1 input → split in halves and recurse ("halve and retry").
+- Any other 4xx (401, bad model) → fail at once, no retry, body surfaced.
+- Per-request timeout `CCC_EMBED_TIMEOUT_S` (default 120).
+
+Witness `tests/poc7-faults.sh` — mock fault modes, zero spend:
+
+1. **429 storm:** every 3rd request 429 (`Retry-After: 0.2`) → 300 files
+   all indexed, rc 0, mock served ≥ 50 429s.
+2. **Oversize:** mock rejects > 8 inputs with 400 "too many tokens";
+   files of ~30 chunks → all indexed, mock saw the rejections and no
+   accepted batch > 8.
+3. **Slow:** every 5th request stalls 10 s, timeout 2 s → all indexed.
+4. **Hard 4xx fails fast:** mock 401 → index rc≠0 with the 401 in the
+   message, mock saw ≤ 2 requests (no retry storm).
+5. **Ledger consistent after faults:** re-run of case 1 after reset pays 0.
+6. **No key leak:** bearer string absent from daemon.log and all output.
+7. **Mutation:** retry disabled → case 1 dies; split disabled → case 2
+   dies; 401 retried → unit dies.
+
+### POC 7 — result (2026-09-28): PASS
+
+- `src/retry.rs` (pure policy, 6 unit tests) + `src/http_fetch.rs` (the
+  attempt loop; in-flight permit held per attempt, so a sleeping retry
+  never blocks other files; per-request timeout).
+- `tests/poc7-faults.sh` **8/8**: 429 every 3rd request → 300/300 files,
+  150 429s absorbed; re-run after reset paid **0**; **control** retries=0
+  → rc=1; oversize (>8 inputs → 400) → 20/20 files, 60 rejections,
+  largest accepted batch 8; stalls of 10 s with a 2 s timeout → 100/100,
+  25 stalls; 401 → rc=1 after **1** request, "failed (401) after 1
+  attempt"; bearer found **0** times in 5 daemon logs + all output, and
+  the leak grep's positive control (daemon banner) found 5.
+- `tests/mutate-remote-embedder.sh` now spans 3 files: **9/9** killed
+  (incl. never-retry, retry-all-4xx, never-split, ignore-Retry-After).
+- Instrument false positive caught: the first 401 check grepped bare
+  "401" and matched the tmp dir `hard401/`. The real message was right;
+  the check now matches `failed (401) after 1 attempt`.
+- `settings.rs` crossed 300 lines with POC 4b/4c edits; path helpers moved
+  to `settings_paths.rs` (re-exported, callers unchanged).
+- Regression: cargo 33/33, e2e 46/0 + 21/0, 4c 7/7.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

@@ -8,7 +8,9 @@ mod db;
 mod embed_cache;
 mod embedder;
 mod embedder_params;
+mod http_fetch;
 mod remote_embedder;
+mod retry;
 mod index_model;
 mod indexer;
 mod mcp;
@@ -18,6 +20,7 @@ mod query;
 mod schema;
 mod single_flight;
 mod settings;
+mod settings_paths;
 mod walk;
 
 use std::path::{Path, PathBuf};
