@@ -12,6 +12,9 @@
 //!   the voyage-egress Worker (`https://…/v1`) for the pinned-IP key pool.
 //! - bearer: `CCC_EMBED_API_KEY_FILE` (path), else `CCC_EMBED_API_KEY`, else
 //!   `VOYAGE_API_KEY`. The key is never included in errors or logs.
+//! - `CCC_EMBED_MAX_INFLIGHT` — cap on concurrent HTTP requests (default 16).
+//!   The indexer fans out one call per file with no limit of its own, so
+//!   this is the only thing standing between a big corpus and a request storm.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::embedder_params::Params;
 
@@ -27,6 +30,7 @@ const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1";
 /// litellm-style provider prefix; Voyage (and the Worker) take the bare id.
 const VOYAGE_PREFIX: &str = "voyage/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_MAX_INFLIGHT: usize = 16;
 
 #[derive(Clone)]
 pub struct RemoteEmbedder {
@@ -36,6 +40,8 @@ pub struct RemoteEmbedder {
     model: String,
     api_key: Option<String>,
     dimension: Arc<OnceCell<usize>>,
+    /// Shared by every clone, so the cap holds across all concurrent files.
+    inflight: Arc<Semaphore>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +75,18 @@ fn resolve_api_key() -> Result<Option<String>> {
 
 impl RemoteEmbedder {
     pub fn new(model: &str, base_url: &str, api_key: Option<String>) -> Result<Self> {
+        Self::with_max_inflight(model, base_url, api_key, DEFAULT_MAX_INFLIGHT)
+    }
+
+    pub fn with_max_inflight(
+        model: &str,
+        base_url: &str,
+        api_key: Option<String>,
+        max_inflight: usize,
+    ) -> Result<Self> {
+        if max_inflight == 0 {
+            bail!("CCC_EMBED_MAX_INFLIGHT must be at least 1");
+        }
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -79,13 +97,18 @@ impl RemoteEmbedder {
             model: model.to_string(),
             api_key,
             dimension: Arc::new(OnceCell::new()),
+            inflight: Arc::new(Semaphore::new(max_inflight)),
         })
     }
 
     /// Build from the environment (see module docs).
     pub fn from_env(model: &str) -> Result<Self> {
         let base = env_nonempty("CCC_EMBED_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
-        Self::new(model, &base, resolve_api_key()?)
+        let cap = match env_nonempty("CCC_EMBED_MAX_INFLIGHT") {
+            Some(v) => v.parse().map_err(|_| anyhow!("CCC_EMBED_MAX_INFLIGHT={v:?} is not a number"))?,
+            None => DEFAULT_MAX_INFLIGHT,
+        };
+        Self::with_max_inflight(model, &base, resolve_api_key()?, cap)
     }
 
     pub fn model(&self) -> &str {
@@ -107,6 +130,8 @@ impl RemoteEmbedder {
             return Ok(Vec::new());
         }
         let url = format!("{}/embeddings", self.base_url);
+        // Held until the response body is read: the slot is busy until then.
+        let _permit = self.inflight.acquire().await.map_err(|_| anyhow!("embedder closed"))?;
         let mut req = self.client.post(&url).json(&self.body(&texts, params));
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -161,3 +186,7 @@ fn order_vectors(data: Vec<EmbeddingData>, expected: usize) -> Result<Vec<Vec<f3
 #[cfg(test)]
 #[path = "remote_embedder_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "remote_embedder_cap_tests.rs"]
+mod cap_tests;

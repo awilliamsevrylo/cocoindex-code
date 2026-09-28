@@ -38,7 +38,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 4 | Rust `ccc` indexes + searches through the Worker | PASS | unit 6/6, 4/4 mutants killed; live 7/7 (dims 1024, auth.py top hit); e2e 46/0 + 21/0 |
 | 4b | per-index model: two models, one daemon; mismatch refused | PASS | unit 8/8, 4/4 mutants killed; live 11/11 (384 + 1024 in one daemon) |
 | 4c | renamed `cccrust`; own `~/.cccrust` + `.cccrust/`; never reads Python config | PASS | isolation 7/7 incl. poison control; e2e 46/0 + 21/0 |
-| 5 | client in-flight requests bounded | — | |
+| 5 | client in-flight bounded; Worker spreads load across slots | PASS | 1K files peak 8 (control 732); live 26 reqs → 13/13 slots, 2 each; 7/7 + 5/5 mutants |
 | 6 | re-run never re-embeds finished chunks | — | |
 | 7 | fault suite (429, oversize, slow) has teeth | — | |
 | 8 | measured throughput picks slot count | — | |
@@ -311,6 +311,72 @@ in its own top level config … not read from ~/.cocoindex_code".
   POC 4 7/7, POC 4b 11/11, both mutation scripts survivors=0.
 - Two test expectations were stale on the old name (`ccc init` hint,
   `ccc index` in the mismatch message) — fixed the tests, not the code.
+
+## POC 5 — pass criteria (written before code)
+
+`mount_each!` runs every file concurrently, and each file makes one embed
+call, so a 50K-page corpus would open 50K simultaneous requests. The bound
+belongs on the thing that costs: in-flight HTTP requests to the embedder.
+A semaphore in `RemoteEmbedder`, size `CCC_EMBED_MAX_INFLIGHT` (default 16
+≈ 13 slots + slack). The engine's `max_inflight_components` is not used: it
+counts components, not requests, and a parent holding a permit while its
+children wait is a deadlock shape.
+
+1. **Unit (mock that counts concurrency):** 64 parallel `embed_batch`
+   calls, cap 8, server holds each 40 ms → peak in-flight **== 8**
+   (≤ proves the bound; == proves real concurrency, so a serial
+   implementation cannot pass). Mutation: remove the permit → dies.
+2. **End to end:** `cccrust index` over 1,000 generated files against a
+   local mock `/v1/embeddings` (Node, records peak concurrency): cap 8 →
+   peak ≤ 8 and every file indexed. **Control:** cap 1000 on the same run →
+   peak > 8 — proves the instrument sees concurrency and the cap is what
+   holds it down.
+3. **No regression:** e2e 46/0 + 21/0, POC 4 7/7.
+
+**Revision (before any Worker code):** a fork's read of `dispatch.ts:65`
+found the round-robin pointer is created per request. cccrust sends one
+request per file (≈ one batch), so every request starts at slot 00 — 16
+concurrent client requests would all land on one key/IP. Verified by
+reading the source. Added criteria for the Worker side:
+
+4. **Spread (unit):** 13 concurrent single-batch requests through one
+   shared dispatcher, each fake call held 20 ms → 13 **distinct** slots
+   used, max in-flight per slot == 1. Mutation: per-request pointer →
+   dies.
+5. **Per-slot cap (unit):** 40 concurrent single-batch requests, 13 slots,
+   cap 2 per slot → no slot ever above 2, all 40 complete (they queue,
+   not fail). Mutation: drop the wait → dies.
+6. **Live:** 26 concurrent requests to the deployed Worker →
+   `voyage_egress.slot` values cover ≥ 10 distinct slots.
+
+### POC 5 — result (2026-09-28): PASS
+
+Client (`cccrust`):
+- `RemoteEmbedder` holds a semaphore shared by every clone
+  (`CCC_EMBED_MAX_INFLIGHT`, default 16), permit held until the body is
+  read. Unit: 64 calls, cap 8 → peak **== 8**; control cap 1000 → peak
+  > 8. Mutant "drop permit" killed (5/5 client mutants, survivors=0).
+- `tests/poc5-bounded.sh` (local Node mock, zero spend) **4/4**: 1,000
+  files, cap 8 → rc=0, 1,000/1,000 files, mock peak **8**, 6 s.
+  Control, cap 100000 → peak **732**, so the instrument sees concurrency.
+
+Worker (`voyage-egress`):
+- `src/scheduler.ts` `SlotScheduler` at module scope: least-loaded healthy
+  slot, ties rotate, ≤ 2 in flight per key, waiters queue instead of
+  stacking; permit released in `finally`. Response gains
+  `voyage_egress.slots`.
+- Unit 19/19 (3 new). `test/mutate-dispatch.sh` 7/7 mutants killed,
+  including "fresh scheduler per request" (the original bug),
+  "no per-slot cap" and "leak permit on a throwing call".
+- Deployed router `79407bcf`. Live `test/poc5-spread.sh` **3/3**: 26/26
+  concurrent requests served by **13/13 distinct slots, 2 each**. Before
+  this fix every single-batch request started at slot 00.
+- Regression: POC 3 live 9/9, POC 4 7/7.
+
+Instrument trap found and fixed: the Rust mutation scripts restored the
+source with `mv`, which puts back an OLDER mtime, so cargo kept the
+mutant's build — a clean `cargo test` then failed with peak 64. Both
+scripts now `touch` after restoring.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

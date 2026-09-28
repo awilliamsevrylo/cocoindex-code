@@ -4,7 +4,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 F=src/index_model.rs
 cp "$F" "$F.orig"
-trap 'mv "$F.orig" "$F"' EXIT
+# touch after restore: mv brings back an OLDER mtime and cargo would keep
+# the stale mutant build (measured: peak_inflight_equals_cap saw 64, not 8).
+trap 'mv "$F.orig" "$F"; touch "$F"' EXIT
 export PATH="$HOME/.cargo/bin:/usr/bin:/bin"
 survivors=0
 

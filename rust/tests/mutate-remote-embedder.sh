@@ -4,7 +4,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 F=src/remote_embedder.rs
 cp "$F" "$F.orig"
-trap 'mv "$F.orig" "$F"' EXIT
+# touch after restore: mv brings back an OLDER mtime and cargo would keep
+# the stale mutant build (measured: peak_inflight_equals_cap saw 64, not 8).
+trap 'mv "$F.orig" "$F"; touch "$F"' EXIT
 export PATH="$HOME/.cargo/bin:/usr/bin:/bin"
 survivors=0
 
@@ -21,6 +23,7 @@ run_mutant drop-params-merge 's/let mut body = Value::Object(params.clone());/le
 run_mutant ignore-response-index 's/let i = d.index.unwrap_or(pos);/let i = pos;/'
 run_mutant no-length-check 's/if data.len() != expected {/if false {/'
 run_mutant keep-voyage-prefix 's/strip_prefix(VOYAGE_PREFIX).unwrap_or(&self.model)/as_str()/'
+run_mutant drop-inflight-permit 's/let _permit = self.inflight.acquire().await.map_err(|_| anyhow!("embedder closed"))?;/let _permit = ();/'
 
 echo "survivors=$survivors"
 exit $survivors

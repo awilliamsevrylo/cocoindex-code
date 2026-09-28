@@ -5,9 +5,12 @@
 // a request (and later requests on the same isolate) away from it.
 import type { Env } from './slot';
 import type { SlotHome } from './placement';
-import { dispatch, NoHealthySlot } from './dispatch';
+import { dispatch, NoHealthySlot, SlotScheduler } from './dispatch';
 
 const cooldownUntil = new Map<number, number>();
+// Module scope: shared by every request this isolate serves, so concurrent
+// single-batch requests spread over all slots (at most 2 calls per key).
+const scheduler = new SlotScheduler(2);
 
 // Voyage ids are bare ("voyage-4-large"); the engine's ApiEmbedder and the
 // Python ccc config use a litellm-style "voyage/" prefix. Accept both.
@@ -50,13 +53,15 @@ export async function handleEmbeddings(
         return stub.embed(slot, batch, model, inputType);
       },
       cooldownUntil,
+      Date.now,
+      scheduler,
     );
     return json({
       object: 'list',
       data: r.vectors.map((embedding, index) => ({ object: 'embedding', index, embedding })),
       model: body.model,
       usage: { prompt_tokens: r.usage_tokens, total_tokens: r.usage_tokens },
-      voyage_egress: { calls: r.calls, rerouted: r.rerouted },
+      voyage_egress: { calls: r.calls, rerouted: r.rerouted, slots: r.slots },
     });
   } catch (e) {
     if (e instanceof NoHealthySlot) return json({ error: 'no_healthy_slot' }, 503);
