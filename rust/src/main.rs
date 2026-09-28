@@ -22,6 +22,7 @@ mod project;
 mod protocol;
 mod query;
 mod schema;
+mod search_exec;
 mod single_flight;
 mod settings;
 mod settings_paths;
@@ -74,6 +75,10 @@ enum Command {
         limit: i64,
         #[arg(long)]
         refresh: bool,
+        #[arg(long)]
+        rerank: bool,
+        #[arg(long, default_value = "primary")]
+        mode: String,
     },
     /// Show project status.
     Status,
@@ -172,6 +177,19 @@ fn print_search_results(outcome: &SearchOutcome) {
     if !outcome.success {
         eprintln!("Search failed: {}", outcome.message.clone().unwrap_or_default());
         return;
+    }
+    let mut tags = Vec::new();
+    if let Some(ref m) = outcome.mode {
+        tags.push(format!("mode={m}"));
+    }
+    if outcome.primary_only == Some(true) {
+        tags.push("primary_only".to_string());
+    }
+    if let Some(ref rs) = outcome.rerank_status {
+        tags.push(format!("rerank={rs}"));
+    }
+    if !tags.is_empty() && (outcome.rerank_status.is_some() || outcome.primary_only.is_some()) {
+        println!("[{}]", tags.join(" "));
     }
     if outcome.results.is_empty() {
         println!("No results found.");
@@ -293,12 +311,15 @@ async fn run() -> Result<()> {
             print_index_stats(&status);
         }
 
-        Command::Search { query, lang, path, offset, limit, refresh } => {
+        Command::Search { query, lang, path, offset, limit, refresh, rerank, mode } => {
             let root = require_project_root()?;
             let root_str = root.to_string_lossy().to_string();
             let query_str = query.join(" ");
             if query_str.trim().is_empty() {
                 bail!("usage: cccrust search \"your query\" [--lang L] [--path GLOB]");
+            }
+            if mode != "primary" && mode != "dual" {
+                bail!("invalid --mode {mode:?}: must be 'primary' or 'dual'");
             }
             if refresh {
                 client::index(&root_str, || eprintln!("Waiting for indexing...")).await?;
@@ -308,13 +329,15 @@ async fn run() -> Result<()> {
                 None => resolve_default_path(&root).map(|p| vec![p]),
             };
             let langs = if lang.is_empty() { None } else { Some(lang) };
-            let outcome = client::search(
+            let outcome = client::search_opts(
                 &root_str,
                 &query_str,
                 langs,
                 paths,
                 limit,
                 offset,
+                Some(rerank),
+                Some(mode),
                 || eprintln!("Waiting for indexing to complete..."),
             )
             .await?;

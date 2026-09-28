@@ -15,8 +15,7 @@ use crate::embedder::{CodeEmbedder, create_embedder};
 use crate::embedder_params::{Params, resolve_embedder_params};
 use crate::index_model::{EmbedderCache, IndexMeta, effective_embedding};
 use crate::protocol::{
-    DaemonProjectInfo, DoctorCheckResult, Request, Response, SearchResult, VERSION, read_msg,
-    write_msg,
+    DaemonProjectInfo, DoctorCheckResult, Request, Response, VERSION, read_msg, write_msg,
 };
 use crate::schema::TABLE_NAME;
 use crate::settings::{
@@ -109,32 +108,23 @@ impl Project {
         paths: &[String],
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<SearchResult>> {
-        let db_path = target_sqlite_db_path(&self.root);
-        if !db_path.exists() {
-            bail!(
-                "Index database not found at {}. Run `cccrust index` first.",
-                db_path.display()
-            );
-        }
+        rerank: Option<bool>,
+        mode: Option<String>,
+    ) -> Result<crate::search_exec::SearchExecution> {
         let (embedder, query_params) = self.embedder().await?;
-        let pool = crate::db::open_readonly_pool(&db_path).await?;
-        let meta = crate::index_model::read_meta(&pool).await?;
-        crate::index_model::check_compatible(meta.as_ref(), &embedder.state_key())?;
-        let query_vec = embedder.embed(query, &query_params).await?;
-        let results =
-            crate::query::query_codebase(&pool, &query_vec, limit, offset, languages, paths).await?;
-        Ok(results
-            .into_iter()
-            .map(|r| SearchResult {
-                file_path: r.file_path,
-                language: r.language,
-                content: r.content,
-                start_line: r.start_line,
-                end_line: r.end_line,
-                score: r.score,
-            })
-            .collect())
+        crate::search_exec::execute_search(
+            &self.root,
+            &embedder,
+            &query_params,
+            query,
+            languages,
+            paths,
+            limit,
+            offset,
+            rerank.unwrap_or(false),
+            mode.as_deref(),
+        )
+        .await
     }
 
     async fn status(&self) -> Response {
@@ -326,6 +316,8 @@ async fn dispatch(req: Request, stream: &mut UnixStream, state: &Arc<DaemonState
             paths,
             limit,
             offset,
+            rerank,
+            mode,
         } => {
             match reg.get_project(&project_root).await {
                 Ok(project) => {
@@ -345,15 +337,19 @@ async fn dispatch(req: Request, stream: &mut UnixStream, state: &Arc<DaemonState
                             &paths.unwrap_or_default(),
                             limit,
                             offset,
+                            rerank,
+                            mode,
                         )
                         .await
                     {
-                        Ok(results) => Response::Search {
-                            total_returned: results.len() as i64,
-                            results,
+                        Ok(exec) => Response::Search {
+                            total_returned: exec.results.len() as i64,
+                            results: exec.results,
                             success: true,
                             offset,
                             message: None,
+                            rerank_status: exec.rerank_status,
+                            primary_only: exec.primary_only,
                         },
                         Err(e) => error_resp(e),
                     };

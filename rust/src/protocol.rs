@@ -72,6 +72,10 @@ pub enum Request {
         paths: Option<Vec<String>>,
         limit: i64,
         offset: i64,
+        #[serde(default)]
+        rerank: Option<bool>,
+        #[serde(default)]
+        mode: Option<String>,
     },
     ProjectStatus { project_root: String },
     DaemonStatus,
@@ -98,6 +102,10 @@ pub enum Response {
         total_returned: i64,
         offset: i64,
         message: Option<String>,
+        #[serde(default)]
+        rerank_status: Option<String>,
+        #[serde(default)]
+        primary_only: Option<bool>,
     },
     ProjectStatus {
         indexing: bool,

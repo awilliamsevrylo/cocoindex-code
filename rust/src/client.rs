@@ -135,15 +135,20 @@ pub struct SearchOutcome {
     pub success: bool,
     pub results: Vec<SearchResult>,
     pub message: Option<String>,
+    pub rerank_status: Option<String>,
+    pub primary_only: Option<bool>,
+    pub mode: Option<String>,
 }
 
-pub async fn search(
+pub async fn search_opts(
     project_root: &str,
     query: &str,
     languages: Option<Vec<String>>,
     paths: Option<Vec<String>>,
     limit: i64,
     offset: i64,
+    rerank: Option<bool>,
+    mode: Option<String>,
     on_waiting: impl Fn(),
 ) -> Result<SearchOutcome> {
     let mut stream = connect().await?;
@@ -156,6 +161,8 @@ pub async fn search(
             paths,
             limit,
             offset,
+            rerank,
+            mode: mode.clone(),
         },
     )
     .await?;
@@ -163,13 +170,50 @@ pub async fn search(
         let resp: Response = read_msg(&mut stream).await?;
         match resp {
             Response::IndexWaiting => on_waiting(),
-            Response::Search { success, results, message, .. } => {
-                return Ok(SearchOutcome { success, results, message });
+            Response::Search {
+                success,
+                results,
+                message,
+                rerank_status,
+                primary_only,
+                ..
+            } => {
+                return Ok(SearchOutcome {
+                    success,
+                    results,
+                    message,
+                    rerank_status,
+                    primary_only,
+                    mode,
+                });
             }
             Response::Error { message, .. } => bail!("Daemon error: {message}"),
             other => bail!("Unexpected response: {other:?}"),
         }
     }
+}
+
+pub async fn search(
+    project_root: &str,
+    query: &str,
+    languages: Option<Vec<String>>,
+    paths: Option<Vec<String>>,
+    limit: i64,
+    offset: i64,
+    on_waiting: impl Fn(),
+) -> Result<SearchOutcome> {
+    search_opts(
+        project_root,
+        query,
+        languages,
+        paths,
+        limit,
+        offset,
+        None,
+        None,
+        on_waiting,
+    )
+    .await
 }
 
 pub struct ProjectStatus {
