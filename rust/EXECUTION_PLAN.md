@@ -867,6 +867,14 @@ merged ranking through CLI, daemon, and MCP.
   embeds the query separately with each profile's `query_params`, applies
   all language/path filters to both searches, and passes ranked candidates
   to `fusion.rs`.
+- Stale/partial secondary behavior: when the secondary index is partial or stale
+  (e.g. chunk count lags the primary), dual search executes against what
+  exists in the secondary, logs a visible warning naming the state (`warning:
+  secondary index partial: N/M chunks`), and records `secondary_coverage:
+  {indexed, expected}` in search response metadata. If the secondary database
+  is missing entirely, dual search degrades gracefully to primary-only with a
+  prominent warning, rather than aborting or returning partial results
+  silently.
 - Dual is recommended and is the default when a secondary exists. CLI
   `cccrust search --dual` forces dual; `--primary-only` and
   `--secondary-only` force an eval/debug arm. These mutually exclusive flags
@@ -906,9 +914,22 @@ merged ranking through CLI, daemon, and MCP.
       secondary model with its configured query params. Document params in
       either request fail the test.
 - [ ] A Rust e2e fixture has a known answer outside the returned top list for
-      primary-only and secondary-only but inside the same-size dual list.
-      This proves fusion adds retrieval value rather than merely concatenating
-      two lists.
+      primary-only and secondary-only (e.g. ranks 11–20) but inside the top-10
+      dual list. To prevent synthetic gaming of RRF at k=60 (where rank-6 in
+      both lists scores 2/(60+6)=0.0303, beating rank-1 in one list at
+      1/(60+1)=0.0164):
+      (1) the fixture's gold chunk must be a genuine grounded code/doc answer,
+      not synthetic noise vectors;
+      (2) containment floor: the promoted fused winner must be within top-20 of
+      at least one single index and have positive cosine similarity > 0.40 in
+      both indexes;
+      (3) dual top-10 must contain the top single-index results minus at most
+      the promoted items (no displacement of high-scoring results by low-cosine
+      overlap).
+- [ ] Dual search against a partial secondary index returns merged results from
+      available chunks, emits the partial-index warning, and includes coverage
+      metadata; dual search with missing secondary DB degrades to primary-only
+      search with a warning without exiting nonzero.
 - [ ] Installed-CLI tests prove configured default dual, explicit `--dual`,
       `--primary-only`, and `--secondary-only`; conflicting flags exit
       nonzero, and dual without a configured secondary exits nonzero with a
@@ -952,19 +973,30 @@ counts are real rather than inherited cache hits.
       `voyage/voyage-code-4`, both 1024 dimensions, with identical file,
       chunk, and `(file,line-range)` identity counts.
 - [ ] The aggregate live Worker concurrency for the two-index run never
-      exceeds `DEFAULT_MAX_INFLIGHT`; the exact configured/default value is
-      printed with the index report.
+      exceeds `DEFAULT_MAX_INFLIGHT` (=32). Measurement method: the client
+      embedder records peak in-flight requests via an atomic counter
+      (`AtomicUsize`) tracked across all concurrent worker threads, and prints
+      `peak_inflight_concurrency: N` in the core index report; asserted
+      `<= DEFAULT_MAX_INFLIGHT`.
 - [ ] The six POC 9 known positives are first checked to exist on disk, then
       dual search finds at least 5/6 in the top five, including the
       extensionless giflib README and kernel `.rst` case.
-- [ ] Run
-      `~/PROJECTS/agent-skills/skills/android-docs/eval/run.mjs` with
-      `queries.tsv` three ways by passing normal cccrust modes: primary-only,
-      secondary-only, and dual. Preserve separate TSV artifacts for all three.
+- [ ] Eval runner extension (deliverable of 11c/11d): extend
+      `~/PROJECTS/agent-skills/skills/android-docs/eval/run.mjs` to accept a
+      `--mode` flag (`--primary-only`, `--secondary-only`, `--dual`, or
+      `--dual --rerank`) that it passes through to `cccrust search`, and write
+      output to `results-<mode>.tsv` (e.g. `results-primary-only.tsv`,
+      `results-secondary-only.tsv`, `results-dual.tsv`). Run `run.mjs` three
+      ways to produce separate TSV artifacts for all three modes.
 - [ ] The report prints `n`, hit@1, and hit@5 for every query style
       (`symbol`, `english`, `error`, `concept`, `compare`, `keyword`,
       `platform`, `paraphrase`) and overall for each of the three modes; the
       six control rows must remain 6/6 hit@5 or the runner is invalid.
+      Both raw baseline totals (59/106 hit@5, 35/106 hit@1) and
+      corrected-expectation totals (62/106 hit@5, 37/106 hit@1, accounting for
+      the 3 known-wrong eval paths in SKILL.md:135: espresso.md substring,
+      CursorWindowAllocationException, DeadObjectException) are reported
+      side-by-side.
 - [ ] Overall dual hit@5 is `>= max(primary hit@5, secondary hit@5)`. If it
       is lower, POC 11c does not pass: retain all measurements and report the
       finding honestly instead of changing the gate or hiding a style.
@@ -1026,12 +1058,15 @@ POC 11b) → Voyage rerank of the merged top-N → final order. This slots after
   `top_k=10`, `return_documents=false` → **HTTP 200, 540 ms wall**,
   `usage.total_tokens=1580`, 10 results returned in descending score order,
   model echoed `rerank-2.5`, response keys `object,data,model,usage`.
-  Further repeat samples are **UNMEASURED**: `~/.drew/voyage.keys` is rewritten
-  concurrently by a key rotator (13 `pa-` lines at 14:39Z and 14:42Z, but a
-  mid-sweep iteration saw 64 tokens, and keys flap `401 Provided API key is
-  invalid`), so three follow-up attempts all returned 401. A single 50-document
-  sample of 540 ms is evidence the endpoint works and is sub-second, not a
-  p50/p95; the eval section below owns the real latency distribution.
+  Follow-up repeat latency distribution is **UNMEASURED**: the earlier claim
+  that `~/.drew/voyage.keys` was concurrently rotated and flapped 401 was false
+  (stat confirms mtime 2026-09-28T05:27:06Z, mode 600, 27 lines: 13 `pa-` keys,
+  9 comments, 5 blanks; `cccrust` does not read this file anyway, using
+  `CCC_EMBED_API_KEY_FILE` -> `~/.drew/voyage-egress.token`). The 401 errors
+  occurred because the tester iterated comment/blank lines as API keys against
+  `api.voyageai.com`. A single 50-document call is evidence of endpoint syntax
+  and data shape, not latency; p50/p95 latency is **UNMEASURED** until the
+  eval run through the deployed Worker pool.
 
 **Core design:**
 
@@ -1052,13 +1087,24 @@ rerank:
   candidates: 50               # fused results sent to Voyage
   top_k: 10                    # results returned / shown after rerank
   document_max_chars: 2000     # per-chunk truncation before send
+  timeout_s: 15                # upstream timeout in seconds before fallback
 ```
 
 - CLI: `--rerank` / `--no-rerank` override `rerank.enabled`, mutually
-  exclusive, like POC 11b's mode flags. Daemon `Request::Search` and the MCP
-  `search` input gain a `rerank` field; every result carries `rerank_score`
-  alongside the fused `score` and the per-index `index_matches` ranks, so a
-  row is debuggable as rerank score + fused rank + per-index ranks.
+  exclusive, like POC 11b's mode flags.
+- Protocol version bump: bump the package/protocol version for 11d (as in 11b)
+  so stale running daemons restart cleanly. Daemon `Request::Search` and the MCP
+  `search` input gain a `rerank: Option<bool>` field.
+- Result header format and score semantics:
+  CLI output header remains `--- Result N (score: X) ---`. When rerank is
+  active, `(score: X)` displays the Voyage `relevance_score` (a floating point
+  score in [0.0, 1.0], matching what downstream analyzers parse). The subsequent
+  provenance line explicitly reports:
+  `Fused rank: M (rrf_score: Z); Indexes: primary rank=A score=B; secondary rank=C score=D`.
+  When rerank is disabled or falls back, `(score: X)` retains the fused RRF
+  score and the provenance line omits `Fused rank`.
+  Daemon and MCP responses include structured fields: `rerank_score: Option<f32>`,
+  `fused_score: f64`, `fused_rank: usize`, and `index_matches`.
 - The documents sent are the **chunk texts** of the fused top-`candidates`
   results, each truncated to `document_max_chars` (and to the model's
   query+document token ceiling), preserving the fused order as the input
@@ -1089,8 +1135,12 @@ rerank:
 *Rust core library (`rust/src/rerank.rs`, <300 lines)*
 
 - [ ] Configurable in `settings.yml` as `rerank: {enabled, model, candidates,
-      top_k}`; omitted block deserializes to disabled with the documented
-      defaults; a config round-trip test preserves every field.
+      top_k, document_max_chars, timeout_s}`; omitted block deserializes to
+      disabled with the documented defaults (default `timeout_s: 15`); a config
+      round-trip test preserves every field.
+- [ ] Protocol version bump: package/protocol version is incremented, and an
+      integration test asserts an older-protocol client receives a version
+      mismatch or triggers daemon restart.
 - [ ] CLI flags `--rerank` / `--no-rerank` exist, conflict with each other,
       and are reachable from the installed `cccrust` binary with no script.
 - [ ] Daemon and MCP `search` expose the rerank switch and return
@@ -1098,35 +1148,43 @@ rerank:
       round-trips preserve it.
 - [ ] Chunk text is what gets sent, truncated to the configured character cap
       and the model's token limits; a test asserts no document exceeds the cap.
-- [ ] Each returned result shows its rerank score **and** its fused rank and
-      per-index ranks; existing single-index output and the
-      `--- Result N (score: X) ---` header stay parseable.
+- [ ] Result header format preserves `--- Result N (score: X) ---` with `X`
+      populated by `relevance_score` when reranked (or fused RRF score on
+      fallback/no-rerank), followed by the provenance line with fused rank/score
+      and per-index matches. Downstream parsers in `android-docs/eval` continue
+      to parse without errors.
 - [ ] All new implementation lives in `rust/src/rerank.rs` (and thin wiring);
       no module exceeds 300 lines; `daemon.rs`/`main.rs` do not absorb rerank
       orchestration.
 
 *Failure policy*
 
-- [ ] If rerank fails, errors, or exceeds a timeout, the response is the
-      **fused order** plus a visible warning naming the failure — never an
-      empty result, never an aborted search.
-- [ ] A test proves the fallback: a fake rerank client that errors/timeout
+- [ ] If rerank fails, errors, or exceeds `timeout_s` (default 15s), the
+      response is the **fused order** plus a visible warning naming the failure
+      (`warning: rerank failed (<error>), falling back to fused RRF order`) —
+      never an empty result, never an aborted search.
+- [ ] A test proves the fallback: a fake rerank client that errors or times out
       yields the fused ranking byte-identical to the no-rerank path, with the
       warning present, and the same test with a healthy client proves rerank
       actually reorders (positive control).
 
 *Eval (POC 11c gains a 4th arm)*
 
-- [ ] `~/PROJECTS/agent-skills/skills/android-docs/eval/run.mjs` runs a 4th
-      mode, `dual+rerank`, and the report prints `n`, hit@1, and hit@5 per
-      query style and overall for all four modes. The current single-index
-      baseline in
+- [ ] Use extended `~/PROJECTS/agent-skills/skills/android-docs/eval/run.mjs`
+      with `--dual --rerank` to write `results-dual-rerank.tsv`. The report
+      prints `n`, hit@1, and hit@5 per query style and overall for all four
+      modes. The current single-index baseline in
       `~/PROJECTS/agent-skills/skills/android-docs/eval/results.tsv` is
       **59/106 hit@5, 35/106 hit@1**, error-string style **3/12**; the six
       control rows must remain 6/6 hit@5 or the runner is invalid.
+      Both raw baseline totals (59/106 hit@5, 35/106 hit@1) and
+      corrected-expectation totals (62/106 hit@5, 37/106 hit@1, accounting for
+      the 3 known-wrong eval paths in SKILL.md:135: espresso.md substring,
+      CursorWindowAllocationException, DeadObjectException) are reported
+      side-by-side.
 - [ ] **PASS** if `dual+rerank hit@1 > baseline hit@1 (35/106)`. Report the
       result honestly either way — a lower number is a retained measurement,
-      not a reason to move the gate.
+      not a reason to move the gate (the gate is monotonically fair across arms).
 - [ ] The report also lists every per-style regression of dual+rerank versus
       the best of the four arms, even when the overall gate passes.
 - [ ] Added latency per query is reported as **p50 and p95**, and rerank
