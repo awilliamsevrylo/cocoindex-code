@@ -63,7 +63,7 @@ async fn a_malformed_blob_is_a_miss_not_a_truncated_hit() {
         .put_many(&[
             (good, &[1.5f32, 2.5][..]),
             (ragged, &[9.0f32, 9.0][..]),
-            (stunted, &[4.0f32][..]),
+            (stunted, &[4.0f32, 4.0][..]),
         ])
         .await
         .unwrap();
