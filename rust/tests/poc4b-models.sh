@@ -6,19 +6,19 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BIN="${CCC_BIN:-$REPO/rust/target/debug/ccc}"
+BIN="${CCC_BIN:-$REPO/rust/target/debug/cccrust}"
 FIX="$REPO/tests/e2e_docker_fixtures/sample_project"
 BASE="${BASE:-https://voyage-egress.andrwill1995.workers.dev/v1}"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.drew/voyage-egress.token}"
 ROOT="${TMPDIR:-/tmp}/ccc_poc4b"
 fail=0
 check() { if [ "$2" = "1" ]; then echo "PASS $1: $3"; else echo "FAIL $1: $3"; fail=1; fi; }
-ddl() { /usr/bin/sqlite3 "$1/.cocoindex_code/target_sqlite.db" "SELECT sql FROM sqlite_master WHERE name='code_chunks_vec'" | grep -oE 'float\[[0-9]+\]'; }
-meta() { /usr/bin/sqlite3 "$1/.cocoindex_code/target_sqlite.db" "SELECT v FROM ccc_index_meta WHERE k='model'" 2>&1; }
+ddl() { /usr/bin/sqlite3 "$1/.cccrust/target_sqlite.db" "SELECT sql FROM sqlite_master WHERE name='code_chunks_vec'" | grep -oE 'float\[[0-9]+\]'; }
+meta() { /usr/bin/sqlite3 "$1/.cccrust/target_sqlite.db" "SELECT v FROM ccc_index_meta WHERE k='model'" 2>&1; }
 
 rm -rf "$ROOT"; mkdir -p "$ROOT/home" "$ROOT/A" "$ROOT/B"
 cp -r "$FIX"/* "$ROOT/A/"; cp -r "$FIX"/* "$ROOT/B/"
-export COCOINDEX_CODE_DIR="$ROOT/home" COCOINDEX_CODE_RUNTIME_DIR="$ROOT/run"
+export CCCRUST_DIR="$ROOT/home" CCCRUST_RUNTIME_DIR="$ROOT/run"
 cat > "$ROOT/home/global_settings.yml" <<EOF
 embedding:
   provider: sentence-transformers
@@ -30,7 +30,7 @@ EOF
 
 (cd "$ROOT/A" && $BIN init >/dev/null 2>&1)
 out=$(cd "$ROOT/B" && $BIN init --index-model voyage/voyage-4-large 2>&1)
-check init-pins-model "$(grep -q 'model: voyage/voyage-4-large' "$ROOT/B/.cocoindex_code/settings.yml" && grep -q 'provider: litellm' "$ROOT/B/.cocoindex_code/settings.yml" && echo 1 || echo 0)" "B settings.yml carries the override"
+check init-pins-model "$(grep -q 'model: voyage/voyage-4-large' "$ROOT/B/.cccrust/settings.yml" && grep -q 'provider: litellm' "$ROOT/B/.cccrust/settings.yml" && echo 1 || echo 0)" "B settings.yml carries the override"
 
 (cd "$ROOT/A" && $BIN index >/dev/null 2>&1); ra=$?
 (cd "$ROOT/B" && $BIN index >/dev/null 2>&1); rb=$?

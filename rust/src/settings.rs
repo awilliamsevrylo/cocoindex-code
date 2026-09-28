@@ -30,7 +30,7 @@ pub const DEFAULT_EXCLUDED_PATTERNS: &[&str] = &[
     "**/dist",
     "**/vendor/*.*/*",
     "**/vendor/*",
-    "**/.cocoindex_code",
+    "**/.cccrust",
 ];
 
 // Python defaults to `Snowflake/snowflake-arctic-embed-xs`, but fastembed's
@@ -153,14 +153,14 @@ pub fn default_user_settings() -> UserSettings {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-const SETTINGS_DIR_NAME: &str = ".cocoindex_code";
+const SETTINGS_DIR_NAME: &str = ".cccrust";
 const SETTINGS_FILE_NAME: &str = "settings.yml";
 const USER_SETTINGS_FILE_NAME: &str = "global_settings.yml";
 const TARGET_SQLITE_DB_NAME: &str = "target_sqlite.db";
 const COCOINDEX_DB_NAME: &str = "cocoindex.db";
 
-/// Directory for database files. Honors `COCOINDEX_CODE_DB_PATH_MAPPING` in the
-/// Python version; that mapping is deferred to Phase 2 (daemon/container).
+/// Directory for database files. The Python tool supports a db path mapping;
+/// that mapping is deferred to Phase 2 (daemon/container).
 pub fn resolve_db_dir(project_root: &Path) -> PathBuf {
     project_root.join(SETTINGS_DIR_NAME)
 }
@@ -174,7 +174,7 @@ pub fn cocoindex_db_path(project_root: &Path) -> PathBuf {
 }
 
 pub fn user_settings_dir() -> PathBuf {
-    if let Ok(override_dir) = std::env::var("COCOINDEX_CODE_DIR") {
+    if let Ok(override_dir) = std::env::var("CCCRUST_DIR") {
         return PathBuf::from(override_dir);
     }
     dirs::home_dir()
@@ -192,7 +192,7 @@ pub fn project_settings_path(project_root: &Path) -> PathBuf {
 
 /// Walk up from `start` looking for an initialized project (`settings.yml`) or
 /// a git repo (`.git/`), stopping at (and excluding) the home directory. Ports
-/// `find_parent_with_marker`. Used by `ccc init` to warn before initializing
+/// `find_parent_with_marker`. Used by `cccrust init` to warn before initializing
 /// inside an existing project/repo.
 pub fn find_parent_with_marker(start: &Path) -> Option<PathBuf> {
     let home = dirs::home_dir().and_then(|h| std::fs::canonicalize(&h).ok());
@@ -225,7 +225,7 @@ pub fn global_settings_mtime_us() -> Option<i64> {
     Some(dur.as_micros() as i64)
 }
 
-/// Walk up from `start` looking for `.cocoindex_code/settings.yml`.
+/// Walk up from `start` looking for `.cccrust/settings.yml`.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     // Absolutize like Python's `start.resolve()` so the upward walk reaches the
     // filesystem root even when `start` is relative or doesn't exist.

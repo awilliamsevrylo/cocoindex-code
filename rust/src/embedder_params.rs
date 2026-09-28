@@ -1,6 +1,6 @@
 //! Validation/resolution of embedder `indexing_params` / `query_params`
 //! (`embedder_params.py`) and the curated defaults table consulted by
-//! `ccc init` (`embedder_defaults.py`).
+//! `cccrust init` (`embedder_defaults.py`).
 
 use std::collections::BTreeSet;
 

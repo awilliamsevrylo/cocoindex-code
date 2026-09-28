@@ -2,15 +2,15 @@
 # Advanced E2E scenarios for the cocoindex-code Rust port: custom config,
 # language overrides, multi-project daemon, model-swap auto-restart, MCP args,
 # odd files, and a real Rust codebase.
-# Run:  bash rust/tests/e2e_advanced.sh   (build `ccc` first, or set CCC_BIN)
+# Run:  bash rust/tests/e2e_advanced.sh   (build `cccrust` first, or set CCC_BIN)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BIN="${CCC_BIN:-$REPO/rust/target/debug/ccc}"
+BIN="${CCC_BIN:-$REPO/rust/target/debug/cccrust}"
 FIX="$REPO/tests/e2e_docker_fixtures/sample_project"
 ROOT="${TMPDIR:-/tmp}/ccc_suite2"
 rm -rf "$ROOT"; mkdir -p "$ROOT"
-export COCOINDEX_CODE_DIR="$ROOT/home" COCOINDEX_CODE_RUNTIME_DIR="$ROOT/run"
+export CCCRUST_DIR="$ROOT/home" CCCRUST_RUNTIME_DIR="$ROOT/run"
 PASS=0; FAIL=0; FN=""
 ok(){ PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); FN="$FN\n   - $1"; printf '  FAIL %s\n' "$1"; }
@@ -20,7 +20,7 @@ stop(){ $BIN daemon stop >/dev/null 2>&1; }
 
 echo "### A. Custom include pattern + language_override"
 P="$ROOT/cfg"; mkdir -p "$P"; cd "$P"; $BIN init >/dev/null 2>&1
-cat > .cocoindex_code/settings.yml <<'EOF'
+cat > .cccrust/settings.yml <<'EOF'
 include_patterns:
 - '**/*.py'
 - '**/*.inc'

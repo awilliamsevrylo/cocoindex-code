@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# POC 4 live witness: Rust ccc indexes + searches through the voyage-egress
-# Worker (provider: litellm). Isolated COCOINDEX_CODE_DIR; the bearer is read
+# POC 4 live witness: cccrust indexes + searches through the voyage-egress
+# Worker (provider: litellm). Isolated CCCRUST_DIR; the bearer is read
 # from a file path, never echoed.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BIN="${CCC_BIN:-$REPO/rust/target/debug/ccc}"
+BIN="${CCC_BIN:-$REPO/rust/target/debug/cccrust}"
 FIX="$REPO/tests/e2e_docker_fixtures/sample_project"
 BASE="${BASE:-https://voyage-egress.andrwill1995.workers.dev/v1}"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.drew/voyage-egress.token}"
@@ -16,7 +16,7 @@ check() { if [ "$2" = "1" ]; then echo "PASS $1: $3"; else echo "FAIL $1: $3"; f
 
 setup_home() { # $1 = token file to use
   rm -rf "$ROOT"; mkdir -p "$ROOT/home" "$ROOT/proj"; cp -r "$FIX"/* "$ROOT/proj/"
-  export COCOINDEX_CODE_DIR="$ROOT/home" COCOINDEX_CODE_RUNTIME_DIR="$ROOT/run"
+  export CCCRUST_DIR="$ROOT/home" CCCRUST_RUNTIME_DIR="$ROOT/run"
   cat > "$ROOT/home/global_settings.yml" <<EOF
 embedding:
   provider: litellm
@@ -48,7 +48,7 @@ echo "$out" | tail -5
 check index-exit-0 "$([ $rc -eq 0 ] && echo 1 || echo 0)" "rc=$rc"
 chunks=$($BIN status 2>&1 | grep -oE 'Chunks: [0-9]+' | grep -oE '[0-9]+')
 check chunks-positive "$([ "${chunks:-0}" -gt 0 ] && echo 1 || echo 0)" "chunks=${chunks:-none}"
-DB="$ROOT/proj/.cocoindex_code/target_sqlite.db"
+DB="$ROOT/proj/.cccrust/target_sqlite.db"
 ddl=$(/usr/bin/sqlite3 "$DB" "SELECT sql FROM sqlite_master WHERE name='code_chunks_vec'" 2>&1)
 check vec-dims-1024 "$(printf '%s' "$ddl" | grep -q 'float\[1024\]' && echo 1 || echo 0)" "ddl=$(printf '%s' "$ddl" | grep -oE 'float\[[0-9]+\]')"
 

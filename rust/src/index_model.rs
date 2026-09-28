@@ -123,18 +123,18 @@ pub async fn read_meta(pool: &SqlitePool) -> Result<Option<IndexMeta>> {
     let get = |name: &str| rows.iter().find(|r| r.get::<String, _>(0) == name).map(|r| r.get::<String, _>(1));
     match (get("model"), get("dims")) {
         (Some(model), Some(dims)) => Ok(Some(IndexMeta { model, dims: dims.parse()? })),
-        _ => bail!("{META_TABLE} is incomplete; run `ccc reset -f` then `ccc index`"),
+        _ => bail!("{META_TABLE} is incomplete; run `cccrust reset -f` then `cccrust index`"),
     }
 }
 
 /// Refuse to search an index with a different model than the one that built
-/// it. A legacy index (no meta) is allowed; the next `ccc index` stamps it.
+/// it. A legacy index (no meta) is allowed; the next `cccrust index` stamps it.
 pub fn check_compatible(meta: Option<&IndexMeta>, configured: &str) -> Result<()> {
     if let Some(m) = meta {
         if m.model != configured {
             bail!(
                 "This index was built with {} ({} dims) but the project is now configured for {}. \
-                 Run `ccc index` to rebuild it with the new model.",
+                 Run `cccrust index` to rebuild it with the new model.",
                 m.model,
                 m.dims,
                 configured

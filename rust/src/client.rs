@@ -58,7 +58,7 @@ async fn raw_connect() -> Result<Outcome> {
 /// When set, an external supervisor (Docker entrypoint, systemd, …) owns daemon
 /// respawn; the client never spawns one — it just waits for the socket.
 fn is_daemon_supervised() -> bool {
-    std::env::var("COCOINDEX_CODE_DAEMON_SUPERVISED").as_deref() == Ok("1")
+    std::env::var("CCCRUST_DAEMON_SUPERVISED").as_deref() == Ok("1")
 }
 
 /// Connect to the daemon, auto-starting or restarting it as needed.

@@ -1,5 +1,5 @@
 //! Project initialization. Ports the non-interactive core of `project.py` /
-//! `ccc init`.
+//! `cccrust init`.
 
 use std::path::{Path, PathBuf};
 
@@ -16,15 +16,15 @@ use crate::settings::{
 /// Model prefixes that route through the remote (`litellm`) provider.
 const LITELLM_PREFIXES: &[&str] = &["voyage/", "cohere/", "gemini/", "nvidia_nim/", "openai/"];
 
-/// Initialize a project at `root`: create `.cocoindex_code/settings.yml` with
-/// defaults, and `~/.cocoindex_code/global_settings.yml` if it doesn't exist.
+/// Initialize a project at `root`: create `.cccrust/settings.yml` with
+/// defaults, and `~/.cccrust/global_settings.yml` if it doesn't exist.
 ///
 /// Only local sentence-transformers (fastembed) is supported, so the global
 /// settings are written with `provider: sentence-transformers` and the given
 /// (or default) model. Curated `indexing_params`/`query_params` are applied
 /// when the model is known.
 pub fn init(root: &Path, model: Option<String>) -> Result<PathBuf> {
-    let settings_dir = root.join(".cocoindex_code");
+    let settings_dir = crate::settings::resolve_db_dir(root);
     std::fs::create_dir_all(&settings_dir)?;
 
     // Project settings (defaults) — write only if absent so we don't clobber.
@@ -73,11 +73,11 @@ pub fn pin_index_model(root: &Path, model: Option<String>, provider: Option<Stri
     let mut ps = load_project_settings(root)?;
     ps.embedding = Some(ProjectEmbedding { provider, model: Some(model.clone()), ..Default::default() });
     save_project_settings(root, &ps)?;
-    println!("Index model pinned: {model} (takes effect on the next `ccc index`)");
+    println!("Index model pinned: {model} (takes effect on the next `cccrust index`)");
     Ok(())
 }
 
-/// Model + dims recorded in an index db, if any (for `ccc status`).
+/// Model + dims recorded in an index db, if any (for `cccrust status`).
 pub async fn index_meta(db_path: &Path) -> Option<IndexMeta> {
     let pool = crate::db::open_readonly_pool(db_path).await.ok()?;
     crate::index_model::read_meta(&pool).await.ok().flatten()

@@ -113,7 +113,7 @@ impl Project {
         let db_path = target_sqlite_db_path(&self.root);
         if !db_path.exists() {
             bail!(
-                "Index database not found at {}. Run `ccc index` first.",
+                "Index database not found at {}. Run `cccrust index` first.",
                 db_path.display()
             );
         }
@@ -198,7 +198,7 @@ struct ProjectRegistry {
     embedder: Option<CodeEmbedder>,
     /// When the embedder is `None` because loading failed (rather than absent
     /// settings), this carries the underlying error so clients see the real
-    /// cause instead of a misleading "run `ccc init`" message.
+    /// cause instead of a misleading "run `cccrust init`" message.
     embedder_error: Option<String>,
     indexing_params: Params,
     query_params: Params,
@@ -213,7 +213,7 @@ impl ProjectRegistry {
         match &self.embedder_error {
             Some(e) => anyhow::anyhow!(e.clone()),
             None => anyhow::anyhow!(
-                "Daemon has no global settings loaded. Run `ccc init` to set up cocoindex-code."
+                "Daemon has no global settings loaded. Run `cccrust init` to set up cocoindex-code."
             ),
         }
     }
@@ -685,7 +685,7 @@ fn backward_compat_warning(user: &UserSettings) -> String {
     )
 }
 
-/// Daemon main (blocking until shutdown). Entry point for `ccc run-daemon`.
+/// Daemon main (blocking until shutdown). Entry point for `cccrust run-daemon`.
 pub async fn run_daemon() -> Result<()> {
     std::fs::create_dir_all(daemon_runtime_dir())?;
 

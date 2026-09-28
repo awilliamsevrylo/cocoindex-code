@@ -37,6 +37,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 3 | `/v1/embeddings` router: token budget, per-slot 429 cooldown | PASS | unit 6/6, 4/4 mutants killed; live 9/9 incl. retrieval sanity |
 | 4 | Rust `ccc` indexes + searches through the Worker | PASS | unit 6/6, 4/4 mutants killed; live 7/7 (dims 1024, auth.py top hit); e2e 46/0 + 21/0 |
 | 4b | per-index model: two models, one daemon; mismatch refused | PASS | unit 8/8, 4/4 mutants killed; live 11/11 (384 + 1024 in one daemon) |
+| 4c | renamed `cccrust`; own `~/.cccrust` + `.cccrust/`; never reads Python config | PASS | isolation 7/7 incl. poison control; e2e 46/0 + 21/0 |
 | 5 | client in-flight requests bounded | — | |
 | 6 | re-run never re-embeds finished chunks | — | |
 | 7 | fault suite (429, oversize, slow) has teeth | — | |
@@ -275,6 +276,41 @@ its own embedding model; one daemon serves projects on different models.
 - No regression: e2e 46/0 + 21/0; POC 4 witness still 7/7.
 - Debt flagged: `daemon.rs` (775) and `main.rs` (551) were already over
   the 300-line rule from the upstream port; +28 / +14 lines here.
+
+## POC 4c — pass criteria (written before code)
+
+Andrew: "change the top level command to cccrust not ccc and have it live
+in its own top level config … not read from ~/.cocoindex_code".
+
+- Binary `cccrust`. Global dir `~/.cccrust/` (`global_settings.yml`,
+  daemon socket/pid/log); overrides `CCCRUST_DIR`, `CCCRUST_RUNTIME_DIR`.
+  No `COCOINDEX_CODE_*` variable is read anywhere.
+- Per-project dir `.cccrust/` (settings + dbs), so a repo indexed by both
+  Python `ccc` and `cccrust` never shares `target_sqlite.db`. Added to
+  default excludes and `.gitignore` handling.
+
+1. **Isolation (negative control):** with `HOME` sandboxed, a poisoned
+   `$HOME/.cocoindex_code/global_settings.yml` (invalid provider) plus
+   `COCOINDEX_CODE_DIR` pointing at it → `cccrust init` + `index` +
+   `search` succeed and write only under `$HOME/.cccrust` and
+   `proj/.cccrust`; nothing is created in `.cocoindex_code`.
+2. **Positive control:** the same poison placed in `$HOME/.cccrust`
+   makes `cccrust` fail — proves the instrument can see a config read.
+3. `grep -rn 'COCOINDEX_CODE\|\.cocoindex_code' rust/src` = 0 hits.
+4. **No regression:** e2e 46/0 + 21/0 and POC 4 / 4b witnesses under the
+   new names.
+
+### POC 4c — result (2026-09-28): PASS
+
+- `tests/poc4c-isolation.sh` **7/7** with a sandboxed HOME: poisoned
+  `~/.cocoindex_code` + `COCOINDEX_CODE_DIR` ignored (init/index/search ok,
+  `auth.py` hit); writes only `~/.cccrust` and `proj/.cccrust`; the Python
+  dir is untouched. **Control:** the same poison in `~/.cccrust` →
+  rc=1 `Unknown provider: "poisoned-provider-zz"`. Source grep = 0.
+- Regression, under the new names: cargo test 18/18, e2e 46/0 + 21/0,
+  POC 4 7/7, POC 4b 11/11, both mutation scripts survivors=0.
+- Two test expectations were stale on the old name (`ccc init` hint,
+  `ccc index` in the mismatch message) — fixed the tests, not the code.
 
 Caveat carried forward (POC 3): the pool is small (all 104.28.x) and the
 fresh control DOs landed on IPs key slots also hold. IPs are not reserved

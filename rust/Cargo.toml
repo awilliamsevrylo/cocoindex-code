@@ -9,7 +9,7 @@ license = "Apache-2.0"
 description = "Rust port of cocoindex-code: embedded code search engine (ccc) built on the CocoIndex Rust SDK"
 
 [[bin]]
-name = "ccc"
+name = "cccrust"
 path = "src/main.rs"
 
 [dependencies]

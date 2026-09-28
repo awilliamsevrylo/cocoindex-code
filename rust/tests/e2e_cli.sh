@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end CLI test suite for the cocoindex-code Rust port.
-# Run from anywhere:  bash rust/tests/e2e_cli.sh   (build `ccc` first, or set CCC_BIN)
+# Run from anywhere:  bash rust/tests/e2e_cli.sh   (build `cccrust` first, or set CCC_BIN)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BIN="${CCC_BIN:-$REPO/rust/target/debug/ccc}"
+BIN="${CCC_BIN:-$REPO/rust/target/debug/cccrust}"
 FIX="$REPO/tests/e2e_docker_fixtures/sample_project"
 ROOT="${TMPDIR:-/tmp}/ccc_suite"
 rm -rf "$ROOT"; mkdir -p "$ROOT"
-export COCOINDEX_CODE_DIR="$ROOT/home" COCOINDEX_CODE_RUNTIME_DIR="$ROOT/run"
+export CCCRUST_DIR="$ROOT/home" CCCRUST_RUNTIME_DIR="$ROOT/run"
 
 PASS=0; FAIL=0; FAILED_NAMES=""
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -21,10 +21,10 @@ stop() { $BIN daemon stop >/dev/null 2>&1; }
 
 echo "### 1. Project setup: init / status-before-index / errors"
 P="$ROOT/proj"; mkdir -p "$P"; cp -r "$FIX"/* "$P/"; cd "$P"
-out=$($BIN search "x" 2>&1);            check "search before init -> init hint" "ccc init" "$out"
+out=$($BIN search "x" 2>&1);            check "search before init -> init hint" "cccrust init" "$out"
 out=$($BIN init 2>&1);                  check "init creates settings"        "Created project settings" "$out"
 out=$($BIN init 2>&1);                  check "re-init guarded"              "already initialized" "$out"
-test -f "$P/.cocoindex_code/settings.yml" && ok "settings.yml written" || bad "settings.yml written"
+test -f "$P/.cccrust/settings.yml" && ok "settings.yml written" || bad "settings.yml written"
 # Search with no index transparently builds it first (parity with Python's daemon).
 out=$($BIN search "verify password" --limit 1 2>&1); check "search auto-indexes (no prior index)" "File:" "$out"
 
@@ -98,9 +98,9 @@ stop
 
 echo "### 9. Reset"
 cd "$P"; out=$($BIN reset -f 2>&1);   check "reset db only" "Databases deleted" "$out"
-test -f "$P/.cocoindex_code/settings.yml" && ok "reset keeps settings" || bad "reset keeps settings"
+test -f "$P/.cccrust/settings.yml" && ok "reset keeps settings" || bad "reset keeps settings"
 out=$($BIN reset --all -f 2>&1);      check "reset --all" "fully reset" "$out"
-test -f "$P/.cocoindex_code/settings.yml" && bad "reset --all removes settings" || ok "reset --all removes settings"
+test -f "$P/.cccrust/settings.yml" && bad "reset --all removes settings" || ok "reset --all removes settings"
 stop
 
 echo "### Summary"

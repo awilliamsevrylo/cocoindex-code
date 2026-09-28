@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use crate::settings::user_settings_dir;
 
 /// Directory holding `daemon.sock`, `daemon.pid`, `daemon.log`. Override with
-/// `COCOINDEX_CODE_RUNTIME_DIR`; defaults to the user-settings dir.
+/// `CCCRUST_RUNTIME_DIR`; defaults to the user-settings dir.
 pub fn daemon_runtime_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("COCOINDEX_CODE_RUNTIME_DIR") {
+    if let Ok(dir) = std::env::var("CCCRUST_RUNTIME_DIR") {
         return PathBuf::from(dir);
     }
     user_settings_dir()

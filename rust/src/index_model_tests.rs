@@ -64,7 +64,7 @@ fn mismatch_is_refused_with_both_models_named() {
     let meta = IndexMeta { model: "litellm:voyage/voyage-4-large".into(), dims: 1024 };
     let err = check_compatible(Some(&meta), "litellm:voyage/voyage-code-4").unwrap_err().to_string();
     assert!(err.contains("voyage-4-large") && err.contains("voyage-code-4"), "{err}");
-    assert!(err.contains("ccc index"), "{err}");
+    assert!(err.contains("cccrust index"), "{err}");
 }
 
 #[test]

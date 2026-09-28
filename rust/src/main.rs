@@ -1,4 +1,4 @@
-//! `ccc` — Rust port of cocoindex-code. Daemon-backed CLI.
+//! `cccrust` — Rust port of cocoindex-code. Daemon-backed CLI.
 
 mod client;
 mod daemon;
@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use crate::client::{ProjectStatus, SearchOutcome};
 
 #[derive(Parser)]
-#[command(name = "ccc", about = "CocoIndex Code — index and search codebases (Rust port).")]
+#[command(name = "cccrust", about = "CocoIndex Code — index and search codebases (Rust port).")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -110,13 +110,13 @@ fn cwd() -> Result<PathBuf> {
 fn require_project_root() -> Result<PathBuf> {
     if !settings::user_settings_path().is_file() {
         bail!(
-            "Global settings not found: {}\nRun `ccc init` to create it with default settings.",
+            "Global settings not found: {}\nRun `cccrust init` to create it with default settings.",
             settings::user_settings_path().display()
         );
     }
     settings::find_project_root(&cwd()?).ok_or_else(|| {
         anyhow::anyhow!(
-            "Not in an initialized project directory.\nRun `ccc init` in your project root to get started."
+            "Not in an initialized project directory.\nRun `cccrust init` in your project root to get started."
         )
     })
 }
@@ -174,8 +174,8 @@ fn print_search_results(outcome: &SearchOutcome) {
     }
 }
 
-const GITIGNORE_COMMENT: &str = "# CocoIndex Code (ccc)";
-const GITIGNORE_ENTRY: &str = "/.cocoindex_code/";
+const GITIGNORE_COMMENT: &str = "# CocoIndex Code, Rust port (cccrust)";
+const GITIGNORE_ENTRY: &str = "/.cccrust/";
 
 fn add_to_gitignore(project_root: &Path) {
     if !project_root.join(".git").is_dir() {
@@ -260,7 +260,7 @@ async fn run() -> Result<()> {
                     if parent != root_canon {
                         bail!(
                             "A parent directory has a project marker: {}\nYou might want to run \
-                             `ccc init` there instead.\nUse `ccc init -f` to initialize here anyway.",
+                             `cccrust init` there instead.\nUse `cccrust init -f` to initialize here anyway.",
                             parent.display()
                         );
                     }
@@ -271,7 +271,7 @@ async fn run() -> Result<()> {
             add_to_gitignore(&root);
             println!("Created project settings: {}", written.display());
             println!("You can edit the settings files to customize indexing behavior.");
-            println!("Run `ccc index` to build the index.");
+            println!("Run `cccrust index` to build the index.");
         }
 
         Command::Index => {
@@ -288,7 +288,7 @@ async fn run() -> Result<()> {
             let root_str = root.to_string_lossy().to_string();
             let query_str = query.join(" ");
             if query_str.trim().is_empty() {
-                bail!("usage: ccc search \"your query\" [--lang L] [--path GLOB]");
+                bail!("usage: cccrust search \"your query\" [--lang L] [--path GLOB]");
             }
             if refresh {
                 client::index(&root_str, || eprintln!("Waiting for indexing...")).await?;
@@ -374,7 +374,7 @@ async fn run() -> Result<()> {
 
 async fn reset(all: bool, force: bool) -> Result<()> {
     let root = require_project_root()?;
-    let cocoindex_dir = root.join(".cocoindex_code");
+    let cocoindex_dir = settings::resolve_db_dir(&root);
     let db_files = [settings::cocoindex_db_path(&root), settings::target_sqlite_db_path(&root)];
     let settings_file = settings::project_settings_path(&root);
 
@@ -424,7 +424,7 @@ async fn reset(all: bool, force: bool) -> Result<()> {
         println!("Databases deleted.");
         if settings::project_settings_path(&root).exists() {
             println!(
-                "Settings file still exists. Run `ccc reset --all` to remove it too,\nor edit it manually."
+                "Settings file still exists. Run `cccrust reset --all` to remove it too,\nor edit it manually."
             );
         }
     }
@@ -452,7 +452,7 @@ async fn doctor(verbose: bool) -> Result<()> {
                     eprintln!("    {line}");
                 }
             } else {
-                eprintln!("    Run `ccc doctor -v` for the full traceback.");
+                eprintln!("    Run `cccrust doctor -v` for the full traceback.");
             }
         }
     };
