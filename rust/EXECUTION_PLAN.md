@@ -42,7 +42,7 @@ Worker source: `workers/voyage-egress/` on this branch.
 | 6 | re-run never re-embeds finished chunks | PASS | reset re-run spend 0 (control 200); kill -9 resume 403/403 limit; 100 identical files → 2; 4/4 mutants |
 | 7 | fault suite (429, oversize, slow, 401, leak) has teeth | PASS | e2e 8/8 incl. retries=0 control + leak positive control; 9/9 mutants |
 | 8 | measured throughput picks slot count | PASS | cap 32 = 479 chunks/s, 13.1x 1-key direct; 3 product fixes (7e510af, d5159ef, 8ccfc94) |
-| 9 | Android docs corpus fully indexed | 9a PASS · 9b pending crawl | snapshot 22,104 files, 270,828 chunks, 676 s, 6/6 positives (voyage-4) |
+| 9 | Android docs corpus fully indexed | 9a PASS · 9b after POC 10 | snapshot 22,104 files, 270,828 chunks, 676 s, 6/6 positives (voyage-4) |
 
 ## POC 0 — result (2026-09-28): PASS, first pin
 
@@ -613,3 +613,49 @@ for `**/Documentation/ABI/**` — this is a corpus policy, not a default.
 
 9b waits on the crawl lanes: 14,690 of 53,978 pages at 11:25 UTC; 8 lost
 lanes were relaunched 11:08 UTC from their Wasabi manifests.
+
+## POC 10 — Chromium crawler replaces the keyless Jina crawl (criteria before code)
+
+**PIVOT NOTE (2026-09-28):** there is no Jina key, so the free-tier crawl runs at
+~65 pages/min (≈10 h left for 37.6K pages). Andrew: use a proper
+Chromium/Playwright crawler fanned out across ~5 gcloud instances, with
+DOMParser + in-page sub-fetches to aggregate, a structure-aware extractor,
+and an open-source HTML→MD converter as the fallback.
+
+Measured before code: static HTML already carries the full article —
+`h1.devsite-page-title` + `div.devsite-article-body` — with `.nocontent`,
+breadcrumb and `devsite-*` chrome around it (guide page 29 KB of 323 KB;
+reference page 64 KB of 2.3 MB). A full page navigation per URL is waste.
+
+Design: one Chromium page per instance, parked on developer.android.com.
+In-page `fetch()` pulls N URLs concurrently (same origin, real browser
+headers), `DOMParser` parses each, the extractor takes the article nodes
+and drops the chrome, and turndown + GFM (tables, fenced code) converts
+them to MD. Readability (@mozilla/readability) + turndown is the fallback
+when the devsite nodes are absent. Output keeps the existing layout
+(`<path>.md`, first line `<!-- source: URL -->`), so the index harness is unchanged.
+
+Durable home: `corpus/android-docs/` in this repo (not /tmp).
+
+**10a — extractor quality (one instance, 24 sample URLs across guide,
+reference, compose, training, studio, kotlin):**
+- [ ] 24/24 produce MD with an H1 matching the page title
+- [ ] 0 chrome leaks: none of "Skip to main content", "Send feedback",
+      "Was this helpful", breadcrumb separators, cookie text
+- [ ] code preserved: pages with `<pre>` yield ≥ as many ``` fences
+- [ ] tables preserved: a reference page with `<table>` yields `|` rows
+- [ ] vs the Jina MD already crawled for the same URLs: body word recall
+      ≥ 0.90 (tokens of Jina's body found in ours), measured and printed
+
+**10b — throughput on one instance (500 URLs):**
+- [ ] pages/min measured; failures < 1%; any 429/403 counted and printed
+- [ ] concurrency picked from the measurement (4/8/16 arms), not guessed
+
+**10c — 5-instance fan-out over the remaining URLs, resumable:**
+- [ ] each instance skips URLs already saved (its manifest), so a relaunch
+      after a VM recycle never re-fetches finished pages
+- [ ] results sync to Wasabi under `android-docs-pw/`; census reports
+      saved/expected per instance
+- [ ] total saved ≥ 98% of 53,978; failures listed with status
+
+Then POC 9b runs on the new corpus.

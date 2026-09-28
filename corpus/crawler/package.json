@@ -1,0 +1,12 @@
+{
+  "name": "android-docs-crawler",
+  "private": true,
+  "type": "module",
+  "description": "Chromium crawler for developer.android.com: in-page fetch + DOMParser + turndown, Readability fallback",
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "playwright": "1.55.0",
+    "turndown": "7.2.4",
+    "turndown-plugin-gfm": "1.0.2"
+  }
+}
